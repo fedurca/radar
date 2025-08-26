@@ -1,121 +1,94 @@
-# radar_object_detection.py
+# python >=3.9
+# pip install numpy
+# pip install /cesta/k/ifxradarsdk-<verze>-py3-none-*.whl
+
+import time
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
 
-class RadarProcessor:
-    def __init__(self, threshold=0.5, min_distance=20):
-        """
-        Initializes the RadarProcessor.
+from ifxradarsdk.fmcw import DeviceFmcw
+from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwMetrics
 
-        Args:
-            threshold (float):  Minimum peak height for object detection.  Adjust based on noise.
-            min_distance (int): Minimum distance between peaks (objects) in samples.
-        """
-        self.threshold = threshold
-        self.min_distance = min_distance
+def print_devices():
+    # Vypíše dostupné radary (včetně UUID), hodí se když máš víc kusů
+    devs = DeviceFmcw.get_list()
+    if not devs:
+        print("Nenalezeno žádné FMCW zařízení.")
+        return
+    print("Nalezená zařízení:")
+    for d in devs:
+        # Objekt má obvykle atributy jako uuid, port apod.
+        print(d)
 
-    def read_radar_data(self, data_source="data.txt"):
-        """
-        Reads radar data from a file or other source.  This is a placeholder.
-        Replace with your actual data acquisition method.
-
-        Args:
-            data_source (str):  Path to the data file (example).
-
-        Returns:
-            numpy.ndarray:  1D array of radar signal data.
-        """
-        # Replace this with your actual data reading code.
-        # Example: Reading from a text file (replace with your sensor's output)
-        try:
-            data = np.loadtxt(data_source)
-            return data
-        except FileNotFoundError:
-            print(f"Error: Data file '{data_source}' not found.")
-            return None
-
-    def process_data(self, radar_data):
-        """
-        Processes the raw radar data to detect objects.
-
-        Args:
-            radar_data (numpy.ndarray): 1D array of radar signal data.
-
-        Returns:
-            tuple: A tuple containing:
-                - peaks (numpy.ndarray): Indices of detected peaks (objects).
-                - properties (dict): Properties of the detected peaks (e.g., peak heights).
-        """
-
-        # 1. Noise Reduction/Filtering (Example: Simple Moving Average)
-        window_size = 5
-        smoothed_data = np.convolve(radar_data, np.ones(window_size)/window_size, mode='same')
-
-        # 2. Peak Detection
-        peaks, properties = find_peaks(smoothed_data, height=self.threshold, distance=self.min_distance)
-        return peaks, properties
-
-    def interpret_results(self, peaks, properties):
-        """
-        Interprets the detected peaks to estimate object properties (e.g., range, velocity).
-        This is highly dependent on your radar system and signal processing.
-
-        Args:
-            peaks (numpy.ndarray): Indices of detected peaks.
-            properties (dict): Properties of the detected peaks.
-
-        Returns:
-            list: A list of dictionaries, where each dictionary represents a detected object
-                  and contains its estimated properties.  Returns an empty list if no objects
-                  are detected.
-        """
-        objects = []
-        for i, peak_index in enumerate(peaks):
-            #  Replace this with your actual calculations based on the peak index
-            #  and radar system parameters.  This is a placeholder.
-            range_estimate = peak_index * 0.1  # Example: range is proportional to peak index
-            amplitude = properties["peak_heights"][i] #peak_heights already there from find_peaks
-            object_data = {"range": range_estimate, "amplitude": amplitude}
-            objects.append(object_data)
-        return objects
-
-    def visualize_results(self, radar_data, peaks):
-        """
-        Visualizes the radar data and detected objects.
-
-        Args:
-            radar_data (numpy.ndarray): 1D array of radar signal data.
-            peaks (numpy.ndarray): Indices of detected peaks.
-        """
-        plt.plot(radar_data)
-        plt.plot(peaks, radar_data[peaks], "x")
-        plt.xlabel("Sample Index")
-        plt.ylabel("Signal Amplitude")
-        plt.title("Radar Data with Detected Objects")
-        plt.show()
-
-
-def main():
+def make_sequence_for_15m(dev: DeviceFmcw, fps: float = 60.0):
     """
-    Main function to demonstrate radar object detection.
+    Sestaví jednoduchou sekvenci z metrik: ~15 m dosah + rozumné rozlišení.
+    Používá 60.75 GHz střední kmitočet UTR11 a 1 RX / 1 TX.
     """
-    processor = RadarProcessor(threshold=10, min_distance=10)  # Adjust threshold and distance
-    radar_data = processor.read_radar_data()
+    # 1) metriky (SDK si podle nich dopočítá rampu / šířku pásma atd.)
+    metrics = FmcwMetrics(
+        range_resolution_m=0.05,         # ~5 cm (pro 15 m je to fajn)
+        max_range_m=15.0,                # cílový dosah
+        max_speed_m_s=0.0,               # statická vzdálenost → rychlost neřešíme
+        speed_resolution_m_s=0.0,
+        center_frequency_Hz=60_750_000_000
+    )
 
-    if radar_data is not None:
-        peaks, properties = processor.process_data(radar_data)
-        objects = processor.interpret_results(peaks, properties)
+    # 2) vytvoř „simple“ sekvenci a doplň podle metrik
+    seq = dev.create_simple_sequence(FmcwSimpleSequenceConfig())
+    seq.loop.repetition_time_s = 1.0 / fps
 
-        if objects:
-            print("Detected Objects:")
-            for i, obj in enumerate(objects):
-                print(f"Object {i+1}: Range = {obj['range']:.2f}, Amplitude = {obj['amplitude']:.2f}")
-        else:
-            print("No objects detected.")
+    # Získáme „chirp loop“ a necháme SDK převést metriky → parametry chirpu
+    chirp_loop = seq.loop.sub_sequence.contents
+    dev.sequence_from_metrics(metrics, chirp_loop)
 
-        processor.visualize_results(radar_data, peaks)
+    # 3) doladění parametrů chirpu, které metriky neřeší
+    chirp = chirp_loop.loop.sub_sequence.contents.chirp
+    chirp.sample_rate_Hz = 1_000_000     # 1 MS/s (bezpečná volba)
+    chirp.rx_mask = 0b0001               # UTR11 = 1 RX
+    chirp.tx_mask = 0b0001               # 1 TX
+    chirp.tx_power_level = 31
+    chirp.if_gain_dB = 33
+    chirp.lp_cutoff_Hz = 500_000
+    chirp.hp_cutoff_Hz = 80_000
 
+    return seq
+
+def main(n_frames: int = 200, fps: float = 60.0, save_npy: bool = False):
+    print_devices()
+
+    # Otevře první dostupné zařízení (alternativně DeviceFmcw(uuid="..."))
+    with DeviceFmcw() as dev:
+        seq = make_sequence_for_15m(dev, fps=fps)
+        dev.set_acquisition_sequence(seq)
+
+        print("Zahajuji čtení snímků…")
+        t0 = time.time()
+        frames = []
+
+        for i in range(n_frames):
+            frame = dev.get_next_frame()
+            # 'frame' je strukturovaný objekt; v praxi pracujeme s frame[0]
+            # a potom s maticí [rx, samples, chirps]. Ověříme si rozměry:
+            f0 = frame[0]
+            if i == 0:
+                try:
+                    print("Tvar frame[0]:", np.array(f0).shape, "dtype:", np.array(f0).dtype)
+                except Exception:
+                    pass
+
+            if save_npy:
+                frames.append(np.array(f0))
+
+            # Tady můžeš přidat vlastní zpracování (FFT do vzdálenosti apod.)
+
+        dt = time.time() - t0
+        print(f"Hotovo. Přečteno {n_frames} snímků za {dt:.2f} s (~{n_frames/dt:.1f} fps).")
+
+        if save_npy and frames:
+            arr = np.stack(frames)
+            np.save("bgt60utr11_frames.npy", arr)
+            print("Uloženo do bgt60utr11_frames.npy")
 
 if __name__ == "__main__":
-    main()
+    # Nastav n_frames=0 pro nekonečné čtení (podle potřeby si připiš while True)
+    main(n_frames=200, fps=60.0, save_npy=False)
