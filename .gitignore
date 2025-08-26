@@ -1,0 +1,14 @@
+# Python
+*.pyc
+*.log
+__pycache__/
+venv/
+*.egg-info/
+
+# Data
+*.csv
+*.dat
+*.txt
+
+# OS
+.DS_Store
