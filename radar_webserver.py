@@ -3,11 +3,12 @@ import sys
 import numpy as np
 from scipy import signal
 from datetime import datetime
+import time
 import asyncio
 import threading
 import uvicorn
 import base64
-import time
+import subprocess
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, Response
@@ -18,26 +19,18 @@ from ifxradarsdk.fmcw import DeviceFmcw
 from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwMetrics
 
 # ===========================================================================
-# --- USER CONFIGURATION ---
+# --- UŽIVATELSKÁ KONFIGURACE ---
 # ===========================================================================
-# --- IMPORTANT: Verify this is the correct port on your Mac using: ls /dev/tty.* ---
-SERIAL_PORT = "/dev/tty.usbmodem2101"
-
 EMA_ALPHA = 0.4
 PEAK_THRESHOLD = 0.2
-FIXED_DISTANCE_CM = 50
-DISTANCE_TOLERANCE_CM = 5
-RANGE_START_CM = 20
-RANGE_END_CM = 100
-DIRECTION_FILTER = 'both'
 # ===========================================================================
 
 # ===========================================================================
-# --- HTML, FAVICON, and WebSocket Manager ---
+# --- HTML, FAVICON A WebSocket Manager ---
 # ===========================================================================
 HTML_CONTENT = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="cs">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -47,16 +40,13 @@ HTML_CONTENT = """
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f0f2f5; color: #1c1e21; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
         .container { background: #fff; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); text-align: center; min-width: 450px; }
         h1 { color: #0d6efd; }
-        #status { font-weight: bold; padding: 0.5rem; border-radius: 6px; margin-bottom: 1rem; }
+        #status { font-weight: bold; padding: 0.5rem; border-radius: 6px; margin-bottom: 1rem; transition: all 0.3s ease-in-out; }
         .status-connected { color: #198754; background-color: #d1e7dd; }
         .status-disconnected { color: #dc3545; background-color: #f8d7da; }
         .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 2rem 0; }
         .metric { background: #e9ecef; padding: 1rem; border-radius: 6px; }
         .metric-label { font-size: 0.9rem; color: #6c757d; }
         .metric-value { font-size: 2rem; font-weight: bold; color: #0d6efd; }
-        #event-log { margin-top: 1rem; text-align: left; background: #212529; color: #f8f9fa; padding: 1rem; border-radius: 6px; height: 120px; overflow-y: scroll; font-family: "SF Mono", "Menlo", monospace; font-size: 0.9rem; }
-        .event { border-bottom: 1px solid #495057; padding-bottom: 5px; margin-bottom: 5px; }
-        .event.alert { color: #ffc107; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -64,13 +54,11 @@ HTML_CONTENT = """
         <div id="status" class="status-disconnected">Connecting...</div>
         <h1>Live Radar Feed</h1>
         <div class="data-grid">
-            <div class="metric"><div class="metric-label">Distance</div><span id="distance" class="metric-value">---</span> cm</div>
-            <div class="metric"><div class="metric-label">Speed</div><span id="speed" class="metric-value">---</span> m/s</div>
-            <div class="metric"><div class="metric-label">Direction</div><span id="direction" class="metric-value">---</span></div>
-            <div class="metric"><div class="metric-label">Peak Signal</div><span id="peak" class="metric-value">---</span></div>
+            <div class="metric"><div class="metric-label">Vzdálenost</div><span id="distance" class="metric-value">---</span> cm</div>
+            <div class="metric"><div class="metric-label">Rychlost</div><span id="speed" class="metric-value">---</span> m/s</div>
+            <div class="metric"><div class="metric-label">Směr</div><span id="direction" class="metric-value">---</span></div>
+            <div class="metric"><div class="metric-label">Síla Signálu</div><span id="peak" class="metric-value">---</span></div>
         </div>
-        <h2>Event Log</h2>
-        <div id="event-log"></div>
     </div>
 
     <script>
@@ -79,51 +67,43 @@ HTML_CONTENT = """
         const speedEl = document.getElementById('speed');
         const directionEl = document.getElementById('direction');
         const peakEl = document.getElementById('peak');
-        const eventLog = document.getElementById('event-log');
 
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        function connect() {
+            const ws = new WebSocket(`ws://${window.location.host}/ws`);
 
-        ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            
-            if (data.status === 'waiting') {
-                statusEl.textContent = 'Waiting for Device...';
-                statusEl.className = 'status-disconnected';
-            } else {
-                statusEl.textContent = 'Connected';
-                statusEl.className = 'status-connected';
-
-                distanceEl.textContent = data.distance_cm.toFixed(1);
-                speedEl.textContent = data.speed_ms.toFixed(2);
-                directionEl.textContent = data.direction;
-                peakEl.textContent = data.peak.toFixed(4);
-
-                if (data.event) {
-                    const newEvent = document.createElement('div');
-                    newEvent.className = 'event alert';
-                    newEvent.innerHTML = `<strong>${data.timestamp}</strong>: ${data.event}`;
-                    eventLog.prepend(newEvent);
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                if (data.status === 'waiting_for_device') {
+                    statusEl.textContent = 'Čekání na připojení zařízení...';
+                    statusEl.className = 'status-disconnected';
+                } else if (data.status === 'connected') {
+                    statusEl.textContent = 'Připojeno';
+                    statusEl.className = 'status-connected';
+                    distanceEl.textContent = data.distance_cm.toFixed(1);
+                    speedEl.textContent = data.speed_ms.toFixed(2);
+                    directionEl.textContent = data.direction;
+                    peakEl.textContent = data.peak.toFixed(4);
                 }
-            }
-        };
+            };
 
-        ws.onopen = function(event) {
-            const newEvent = document.createElement('div');
-            newEvent.className = 'event';
-            newEvent.textContent = 'WebSocket connection established.';
-            eventLog.prepend(newEvent);
-        };
+            ws.onopen = function(event) {
+                statusEl.textContent = 'Server připojen';
+                statusEl.className = 'status-connected';
+            };
 
-        ws.onclose = function(event) {
-            statusEl.textContent = 'SERVER DISCONNECTED';
-            statusEl.className = 'status-disconnected';
-        };
+            ws.onclose = function(event) {
+                statusEl.textContent = 'SERVER ODPOJEN - Pokus o znovupřipojení...';
+                statusEl.className = 'status-disconnected';
+                setTimeout(connect, 3000);
+            };
+        }
+        connect();
     </script>
 </body>
 </html>
 """
-
-FAVICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAALEwAACxMBAJqcGAAAA6ZJREFUWIWVl1tsVFUUhr9zz5kzbWcbChZCsGBSCAnFRKE0iIgBCQZEYwISiwoaBMMHE4wflAQjERFEoxGNFSTgAypgDBgRQUUiCYigENpSKe300pmedk7PuffMH7vTzlBK+5A/ueTcc/7v/c/Zo2PG8M+Cyf8sQjIjiI5IG8HkJZJ2A4kQEj0xQJ2FLClpBZEgJKeBVEhI8pba2v1d2+79/RwAE88AiBDS2wBw1522j5/aW2+98XQO56QEkpWw6+f7L1y0/cuo23/v2o62yzzhQQG84wBUNk4AOKx314/yqI/fqgP5d+e+WwPAg/2b1v/z0y/V7P8HlEwVwHflXn0+AqB38/E3T1T2/e/r0b2b1j/z089VP+t/j1SMC8A7ZcK99y8/ffNqOAEoZ2D83p9+fHHzd5/6w/3b1285XfL+9/e/GgEACn58cfN3n/rDP5x7/f5pY+Pl2/c2+7+f+7gLgBQAQAgFkEwGIAUAgKkDgH8BwC4BwFcA8BYAcFcAaA0Ae1qA2f8G2a21Nl4u4N0BwGvK2A5/t7v9gX/Mvj72/bPnN156D8o/AECJ8fK1o2fWf3zw12+Wj00+e+a5nZtbP1YDAAghycnY2v2fPnvmuZ2bWz82Pj4+f3bx/M2bX71+3b/z8s7N48ePp/y/r1x968qVX7ZtZ/9f16/7d14+8sWzZ+t/3b79D4A7AKCszM8/f+S6r5+/ffqPkyc+P3v2rD/JOfn1a9e+Wlr6h5MnPj979qxdlsvl8uXLFx/+6KOP1qx58sSJU/03W1u/bNv2v927d3c0Gg0A2TIZAEopgBACAPQCAIQQAABKKT8/v0eapslEImEEAhEAREQAAIAQ4uXlpaUUBgARAIAL8fLyoqPjR1pbe7/x8fE3AODl5UU/P/+v6XT6OAAwPz//99nZ2d8BwOzs7O+KxeI/AwAvL+/fJpNJ/g/4AfD92z740eHhAAAAAElFTSuQmCC"
+FAVICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAVUlEQVRYw+3VwQkAIBAEwP3/p5xABCKdG1pr1fB00QYxJgCIiAgAEREBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABF9cgILAEJMfX28AAAAAElFTSuQmCC"
 
 class ConnectionManager:
     def __init__(self):
@@ -132,21 +112,24 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        print("[DEBUG] New client connected. Total clients:", len(self.active_connections))
 
     def disconnect(self, websocket: WebSocket):
         self.active_connections.remove(websocket)
-        print("[DEBUG] Client disconnected. Total clients:", len(self.active_connections))
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
-            await connection.send_json(message)
+        # Kopie seznamu pro případ, že se změní během iterace
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                # Klient se mezitím odpojil
+                self.active_connections.remove(connection)
 
 manager = ConnectionManager()
 # ===========================================================================
 
 # ===========================================================================
-# Algorithm Class
+# Algoritmus
 # ===========================================================================
 class DopplerAlgo:
     def __init__(self, num_samples_per_chirp, num_chirps_per_frame, metrics):
@@ -180,23 +163,26 @@ class DopplerAlgo:
 # ===========================================================================
 
 # ===========================================================================
-# Radar Measurement Thread
+# Vlákno pro měření radaru
 # ===========================================================================
-def run_radar_loop(frate):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    def broadcast_sync(message: dict):
-        asyncio.run_coroutine_threadsafe(manager.broadcast(message), loop)
+def ts():
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-    smoothed_distance = None
-    smoothed_speed = None
+# --- FIX: Vláknu se nyní předává hlavní smyčka událostí serveru ---
+def run_radar_loop(frate, loop: asyncio.AbstractEventLoop):
+    def broadcast_sync(message: dict):
+        # Používá předanou smyčku pro bezpečné odeslání zpráv
+        asyncio.run_coroutine_threadsafe(manager.broadcast(message), loop)
+    
+    time.sleep(2)
+
+    smoothed_distance, smoothed_speed = None, None
         
-    while True: # --- MODIFIED: Outer loop for resilient reconnection ---
+    while True:
         try:
-            print(f"[INFO] Attempting to connect to radar on port {SERIAL_PORT}...")
-            with DeviceFmcw(port=SERIAL_PORT) as device:
-                print("[SUCCESS] Radar device connected.")
+            print(f"[{ts()}] [INFO] Pokus o připojení k radaru pomocí auto-detekce...")
+            with DeviceFmcw() as device:
+                print(f"[{ts()}] [SUCCESS] Radarové zařízení připojeno: {device.get_sensor_type()}")
                 metrics = FmcwMetrics(
                     range_resolution_m=0.05, max_range_m=1.6, max_speed_m_s=3,
                     speed_resolution_m_s=0.2, center_frequency_Hz=60_750_000_000,
@@ -211,14 +197,17 @@ def run_radar_loop(frate):
                 chirp.lp_cutoff_Hz = 500000; chirp.hp_cutoff_Hz = 80000
                 device.set_acquisition_sequence(sequence)
                 
+                device.start_acquisition()
+                print(f"[{ts()}] [INFO] Měření spuštěno, čekání na data...")
+                
                 algo = DopplerAlgo(chirp.num_samples, chirp_loop.loop.num_repetitions, metrics)
                 
-                while True: # Inner loop for reading frames
+                while True:
                     frame_contents = device.get_next_frame()
                     antenna_samples = frame_contents[0][0, :, :]
                     distance_m, speed_ms, peak_value = algo.compute_doppler_map(antenna_samples)
                     
-                    event_message = None
+                    data_payload = None
                     if peak_value >= PEAK_THRESHOLD:
                         distance_cm = distance_m * 100
                         if smoothed_distance is None:
@@ -227,41 +216,41 @@ def run_radar_loop(frate):
                             smoothed_distance = EMA_ALPHA * distance_cm + (1 - EMA_ALPHA) * smoothed_distance
                             smoothed_speed = EMA_ALPHA * speed_ms + (1 - EMA_ALPHA) * smoothed_speed
 
-                        if abs(smoothed_speed) < metrics.speed_resolution_m_s: direction = "static"
-                        elif smoothed_speed < 0: direction = "approaching"
-                        else: direction = "receding"
+                        if abs(smoothed_speed) < metrics.speed_resolution_m_s: direction = "Statický"
+                        elif smoothed_speed < 0: direction = "Přibližování"
+                        else: direction = "Vzdalování"
                         
-                        if abs(smoothed_distance - FIXED_DISTANCE_CM) <= DISTANCE_TOLERANCE_CM:
-                            event_message = f"EVENT: Target at fixed distance ({smoothed_distance:.0f} cm)"
-                        if RANGE_START_CM <= smoothed_distance <= RANGE_END_CM and (DIRECTION_FILTER == 'both' or DIRECTION_FILTER == direction):
-                            event_message = f"EVENT: Movement in range ({direction} at {smoothed_distance:.0f} cm)"
-                    else:
-                        smoothed_distance, smoothed_speed, direction, peak_value = 0.0, 0.0, "---", 0.0
+                        data_payload = { "status": "connected",
+                                         "distance_cm": smoothed_distance, "speed_ms": smoothed_speed,
+                                         "direction": direction, "peak": peak_value }
+                        
+                        # --- FIX: Logování pouze nenulových hodnot ---
+                        output_string = (f"{ts()} | Vzdálenost: {data_payload['distance_cm']:.1f} cm | "
+                                         f"Rychlost: {data_payload['speed_ms']:+.2f} m/s | "
+                                         f"Směr: {direction} | Peak: {peak_value:.4f}")
+                        print(output_string)
 
-                    data_payload = { "status": "connected", "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                                     "distance_cm": smoothed_distance if smoothed_distance is not None else 0.0,
-                                     "speed_ms": smoothed_speed if smoothed_speed is not None else 0.0,
-                                     "direction": direction if 'direction' in locals() and smoothed_distance is not None else "---",
-                                     "peak": peak_value, "event": event_message }
-                    broadcast_sync(data_payload)
+                    # Odesíláme data jen pokud existují (nejsou nulová)
+                    if data_payload:
+                        broadcast_sync(data_payload)
         
         except Exception as e:
-            print(f"[ERROR] Radar loop failed: {e}. Device disconnected.")
-            # --- NEW: Send 'waiting' status to web clients ---
-            broadcast_sync({"status": "waiting"})
-            # Reset smoothing on disconnect
-            smoothed_distance = None
-            smoothed_speed = None
-            time.sleep(5) # Wait 5 seconds before trying to reconnect
+            print(f"[{ts()}] [ERROR] Smyčka radaru selhala: {e}")
+            broadcast_sync({"status": "waiting_for_device"})
+            smoothed_distance, smoothed_speed = None, None
+            time.sleep(5)
 
 # ===========================================================================
-# FastAPI App and Endpoints
+# FastAPI App a Endpoints
 # ===========================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    radar_thread = threading.Thread(target=run_radar_loop, args=(60,), daemon=True)
+    # --- FIX: Získání hlavní smyčky událostí a její předání do vlákna ---
+    loop = asyncio.get_running_loop()
+    radar_thread = threading.Thread(target=run_radar_loop, args=(60, loop), daemon=True)
     radar_thread.start()
     yield
+    print(f"\n[{ts()}] [INFO] Server se vypíná.")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -279,11 +268,13 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             await asyncio.sleep(1)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.CancelledError):
         manager.disconnect(websocket)
-        print("[DEBUG] WebSocket disconnected.")
+        print(f"[{ts()}] [DEBUG] WebSocket odpojen.")
 
-# Main entry point for running the server
 if __name__ == '__main__':
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    except KeyboardInterrupt:
+        print(f"\n[{ts()}] [INFO] Ukončeno uživatelem (Ctrl+C).")
 # ===========================================================================
