@@ -14,8 +14,9 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from collections import deque
+
+# --- NEW: Knihovna pro měření využití systému ---
 import psutil
-import os
 
 from ifxradarsdk import get_version_full
 from ifxradarsdk.fmcw import DeviceFmcw
@@ -28,7 +29,7 @@ EMA_ALPHA = 0.4
 DEFAULT_PEAK_THRESHOLD = 0.2
 DEFAULT_RANGE_KEY = "8m (Výchozí)"
 DEFAULT_FRAME_RATE = 20
-DEFAULT_NUM_CHIRPS = 32
+DEFAULT_NUM_CHIRPS = 25
 START_TIME = datetime.now()
 
 RANGE_PRESETS = {
@@ -44,8 +45,8 @@ FRAME_RATES_HZ = [5, 10, 20, 30, 40, 50, 60]
 # --- PŘEKLADY ---
 # ===========================================================================
 LANGUAGES = {
-    "en": {"title": "Radar Live View", "status_connecting": "Connecting...", "status_connected_server": "Server Connected", "status_waiting": "Waiting for Device...", "status_reconfiguring": "Reconfiguring Radar...", "status_connected_device": "Connected", "status_disconnected_server": "SERVER DISCONNECTED - Reconnecting...", "header": "Live Radar Feed", "range_label": "Range:", "frate_label": "Frequency:", "sensitivity_label": "Sensitivity:", "num_chirps_label": "Chirps per Frame:", "distance": "Distance", "speed": "Speed", "direction": "Direction", "peak_signal": "Peak Signal", "sensor_uptime": "Sensor Uptime", "program_uptime": "Program Uptime", "log_header": "Diagnostic Log", "static": "Static", "approaching": "Approaching", "receding": "Receding", "toggle_theme": "Toggle Theme", "lang_toggle": "Česky", "hold_label": "Hold Last Value", "save_plot": "Save Plot as JPEG", "cpu_usage": "CPU Usage", "ram_usage": "Memory Usage", "pause_plot": "Pause Plot", "resume_plot": "Resume Plot"},
-    "cz": {"title": "Radar Live Vizualizace", "status_connecting": "Připojování...", "status_connected_server": "Server připojen", "status_waiting": "Čekání na zařízení...", "status_reconfiguring": "Rekonfigurace radaru...", "status_connected_device": "Připojeno", "status_disconnected_server": "SERVER ODPOJEN - Pokus o znovupřipojení...", "header": "Živá data z radaru", "range_label": "Rozsah:", "frate_label": "Frekvence:", "sensitivity_label": "Citlivost:", "num_chirps_label": "Chirpů na snímek:", "distance": "Vzdálenost", "speed": "Rychlost", "direction": "Směr", "peak_signal": "Síla signálu", "sensor_uptime": "Doba připojení", "program_uptime": "Doba běhu", "log_header": "Diagnostický Log", "static": "Statický", "approaching": "Přibližování", "receding": "Vzdalování", "toggle_theme": "Přepnout vzhled", "lang_toggle": "English", "hold_label": "Podržet poslední hodnotu", "save_plot": "Uložit graf jako JPEG", "cpu_usage": "Využití CPU", "ram_usage": "Využití paměti", "pause_plot": "Pozastavit graf", "resume_plot": "Spustit graf"}
+    "en": {"title": "Radar Live View", "status_connecting": "Connecting...", "status_connected_server": "Server Connected", "status_waiting": "Waiting for Device...", "status_reconfiguring": "Reconfiguring Radar...", "status_connected_device": "Connected", "status_disconnected_server": "SERVER DISCONNECTED - Reconnecting...", "header": "Live Radar Feed", "range_label": "Range:", "frate_label": "Frequency:", "sensitivity_label": "Sensitivity:", "num_chirps_label": "Chirps per Frame:", "distance": "Distance", "speed": "Speed", "direction": "Direction", "peak_signal": "Peak Signal", "sensor_uptime": "Sensor Uptime", "program_uptime": "Program Uptime", "log_header": "Diagnostic Log", "static": "Static", "approaching": "Approaching", "receding": "Receding", "toggle_theme": "Toggle Theme", "lang_toggle": "Česky", "hold_label": "Hold Last Value", "save_plot": "Save Plot as JPEG", "cpu_usage": "CPU Usage", "ram_usage": "RAM Usage"},
+    "cz": {"title": "Radar Live Vizualizace", "status_connecting": "Připojování...", "status_connected_server": "Server připojen", "status_waiting": "Čekání na zařízení...", "status_reconfiguring": "Rekonfigurace radaru...", "status_connected_device": "Připojeno", "status_disconnected_server": "SERVER ODPOJEN - Pokus o znovupřipojení...", "header": "Živá data z radaru", "range_label": "Rozsah:", "frate_label": "Frekvence:", "sensitivity_label": "Citlivost:", "num_chirps_label": "Chirpů na snímek:", "distance": "Vzdálenost", "speed": "Rychlost", "direction": "Směr", "peak_signal": "Síla signálu", "sensor_uptime": "Doba připojení", "program_uptime": "Doba běhu", "log_header": "Diagnostický Log", "static": "Statický", "approaching": "Přibližování", "receding": "Vzdalování", "toggle_theme": "Přepnout vzhled", "lang_toggle": "English", "hold_label": "Podržet poslední hodnotu", "save_plot": "Uložit graf jako JPEG", "cpu_usage": "Využití CPU", "ram_usage": "Využití RAM"}
 }
 # ===========================================================================
 
@@ -89,7 +90,7 @@ HTML_CONTENT = """
         .left-panel { flex: 2; } .right-panel { flex: 1; }
         .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; text-align: left; }
         .control-group { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-        .control-group-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; grid-column: 1 / -1; }
+        .control-group-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
         .controls select, .controls input { font-size: 1rem; padding: 0.5rem; border-radius: 6px; border: 1px solid var(--border-color); background-color: var(--card-bg-color); color: var(--text-color); width: 100%; }
         input[type="checkbox"] { width: auto; }
         .data-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1.5rem; }
@@ -98,11 +99,9 @@ HTML_CONTENT = """
         .metric-value { font-size: 1.8rem; font-weight: bold; color: var(--text-color); }
         .mini-bargraph-container { width: 100%; height: 10px; background-color: var(--border-color); border-radius: 5px; margin-top: 0.75rem; overflow: hidden; }
         .mini-bargraph-bar { height: 100%; width: 0%; border-radius: 5px; transition: width 0.1s linear, background-color 0.3s; }
-        .min-max { font-size: 0.8rem; color: var(--secondary-text-color); margin-top: 8px; display: flex; justify-content: space-between; padding: 0 5px; }
-        #plot-container { margin-top: 1.5rem; }
+        #plot-container { margin-top: 1.5rem; text-align: right; }
         #plot-canvas { width: 100%; height: 120px; background-color: var(--secondary-bg-color); border-radius: 6px; border: 1px solid var(--border-color); }
-        .plot-controls { text-align: right; margin-top: 0.5rem; }
-        .plot-controls button { font-size: 0.8rem; padding: 0.5rem; cursor: pointer; background-color: var(--secondary-bg-color); border: 1px solid var(--border-color); color: var(--text-color); border-radius: 6px; margin-left: 0.5rem; }
+        #save-plot-btn { margin-top: 0.5rem; font-size: 0.8rem; padding: 0.5rem; cursor: pointer; background-color: var(--secondary-bg-color); border: 1px solid var(--border-color); color: var(--text-color); border-radius: 6px; }
         #log-container { display: flex; flex-direction: column; height: 100%; }
         #log-header { margin-top: 0; text-align: left; }
         #log { flex: 1; background: var(--secondary-bg-color); color: var(--text-color); padding: 1rem; border-radius: 6px; overflow-y: scroll; font-family: "SF Mono", "Menlo", monospace; font-size: 0.8rem; text-align: left; }
@@ -145,8 +144,8 @@ HTML_CONTENT = """
                     </div>
                     <div class="control-group">
                         <label for="num-chirps-slider" data-lang="num_chirps_label">Chirps per Frame:</label>
-                        <input type="range" id="num-chirps-slider" min="8" max="64" step="4" value="32">
-                        <span id="num-chirps-value">32</span>
+                        <input type="range" id="num-chirps-slider" min="8" max="64" step="4" value="25">
+                        <span id="num-chirps-value">25</span>
                     </div>
                     <div class="control-group">
                         <label for="sensitivity-slider" data-lang="sensitivity_label">Sensitivity:</label>
@@ -159,36 +158,16 @@ HTML_CONTENT = """
                     </div>
                 </div>
                 <div class="data-grid">
-                    <div class="metric">
-                        <div class="metric-label" data-lang="distance">Distance</div>
-                        <span id="distance" class="metric-value">---</span> cm
-                        <div class="min-max"><span data-lang="min_label">Min</span>: <span id="min_dist">--</span> | <span data-lang="max_label">Max</span>: <span id="max_dist">--</span></div>
-                        <div class="mini-bargraph-container"><div id="distance-mini-bar" class="mini-bargraph-bar"></div></div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-label" data-lang="speed">Speed</div>
-                        <span id="speed" class="metric-value">---</span> m/s
-                        <div class="min-max"><span data-lang="min_label">Min</span>: <span id="min_speed">--</span> | <span data-lang="max_label">Max</span>: <span id="max_speed">--</span></div>
-                        <div class="mini-bargraph-container"><div id="speed-mini-bar" class="mini-bargraph-bar"></div></div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-label" data-lang="peak_signal">Peak Signal</div>
-                        <span id="peak" class="metric-value">---</span>
-                        <div class="min-max"><span data-lang="min_label">Min</span>: <span id="min_peak">--</span> | <span data-lang="max_label">Max</span>: <span id="max_peak">--</span></div>
-                        <div class="mini-bargraph-container"><div id="peak-mini-bar" class="mini-bargraph-bar"></div></div>
-                    </div>
+                    <div class="metric"><div class="metric-label" data-lang="distance">Distance</div><span id="distance" class="metric-value">---</span> cm<div class="mini-bargraph-container"><div id="distance-mini-bar" class="mini-bargraph-bar"></div></div></div>
+                    <div class="metric"><div class="metric-label" data-lang="speed">Speed</div><span id="speed" class="metric-value">---</span> m/s<div class="mini-bargraph-container"><div id="speed-mini-bar" class="mini-bargraph-bar"></div></div></div>
+                    <div class="metric"><div class="metric-label" data-lang="peak_signal">Peak Signal</div><span id="peak" class="metric-value">---</span><div class="mini-bargraph-container"><div id="peak-mini-bar" class="mini-bargraph-bar"></div></div></div>
                     <div class="metric"><div class="metric-label" data-lang="direction">Direction</div><span id="direction" class="metric-value">---</span></div>
                     <div class="metric"><div class="metric-label" data-lang="sensor_uptime">Sensor Uptime</div><span id="sensor_uptime" class="metric-value">---</span></div>
                     <div class="metric"><div class="metric-label" data-lang="program_uptime">Program Uptime</div><span id="program_uptime" class="metric-value">---</span></div>
                 </div>
-                <div class="bargraph-container"><div id="distance-bar" class="bargraph-bar"></div></div>
-                <div class="bargraph-axis"><span>0cm</span><span id="axis-mid"></span><span id="axis-max"></span></div>
                 <div id="plot-container">
                     <canvas id="plot-canvas"></canvas>
-                    <div class="plot-controls">
-                        <button id="pause-plot-btn" data-lang="pause_plot">Pause Plot</button>
-                        <button id="save-plot-btn" data-lang="save_plot">Save Plot as JPEG</button>
-                    </div>
+                    <button id="save-plot-btn" data-lang="save_plot">Save Plot as JPEG</button>
                 </div>
             </div>
             <div class="right-panel" id="log-container">
@@ -196,7 +175,7 @@ HTML_CONTENT = """
                 <div id="log"></div>
                 <div class="data-grid" style="grid-template-columns: 1fr; margin-top: auto; padding-top: 1rem; border-top: 1px solid var(--border-color);">
                     <div class="metric"><div class="metric-label" data-lang="cpu_usage">CPU Usage</div><span id="cpu" class="metric-value">---</span> %<div class="mini-bargraph-container"><div id="cpu-mini-bar" class="mini-bargraph-bar"></div></div></div>
-                    <div class="metric"><div class="metric-label" data-lang="ram_usage">RAM Usage</div><span id="ram" class="metric-value">---</span> MB<div class="mini-bargraph-container"><div id="ram-mini-bar" class="mini-bargraph-bar"></div></div></div>
+                    <div class="metric"><div class="metric-label" data-lang="ram_usage">RAM Usage</div><span id="ram" class="metric-value">---</span> %<div class="mini-bargraph-container"><div id="ram-mini-bar" class="mini-bargraph-bar"></div></div></div>
                 </div>
             </div>
         </div>
@@ -204,27 +183,38 @@ HTML_CONTENT = """
 
     <script>
         (() => {
-            const ui = { status: document.getElementById('status'), distance: document.getElementById('distance'), speed: document.getElementById('speed'), direction: document.getElementById('direction'), peak: document.getElementById('peak'), sensor_uptime: document.getElementById('sensor_uptime'), program_uptime: document.getElementById('program_uptime'), cpu: document.getElementById('cpu'), ram: document.getElementById('ram'), bar: document.getElementById('distance-bar'), bar_dist: document.getElementById('distance-mini-bar'), bar_speed: document.getElementById('speed-mini-bar'), bar_peak: document.getElementById('peak-mini-bar'), bar_cpu: document.getElementById('cpu-mini-bar'), bar_ram: document.getElementById('ram-mini-bar'), log: document.getElementById('log'), rangeSelector: document.getElementById('range-selector'), frateSelector: document.getElementById('frate-selector'), sensitivitySlider: document.getElementById('sensitivity-slider'), sensitivityValue: document.getElementById('sensitivity-value'), numChirpsSlider: document.getElementById('num-chirps-slider'), numChirpsValue: document.getElementById('num-chirps-value'), themeToggle: document.getElementById('theme-toggle'), langToggle: document.getElementById('lang-toggle'), holdToggle: document.getElementById('hold-toggle'), plotCanvas: document.getElementById('plot-canvas'), savePlotBtn: document.getElementById('save-plot-btn'), pausePlotBtn: document.getElementById('pause-plot-btn'), axisMid: document.getElementById('axis-mid'), axisMax: document.getElementById('axis-max'), min_dist: document.getElementById('min_dist'), max_dist: document.getElementById('max_dist'), min_speed: document.getElementById('min_speed'), max_speed: document.getElementById('max_speed'), min_peak: document.getElementById('min_peak'), max_peak: document.getElementById('max_peak') };
-            let maxDistanceCm = 800, maxSpeedMs = 3, maxPeak = 10, maxRamMb = 256, langDict = {}, lastValidData = null, isPlotPaused = false;
+            const ui = { status: document.getElementById('status'), distance: document.getElementById('distance'), speed: document.getElementById('speed'), direction: document.getElementById('direction'), peak: document.getElementById('peak'), sensor_uptime: document.getElementById('sensor_uptime'), program_uptime: document.getElementById('program_uptime'), cpu: document.getElementById('cpu'), ram: document.getElementById('ram'), bar_dist: document.getElementById('distance-mini-bar'), bar_speed: document.getElementById('speed-mini-bar'), bar_peak: document.getElementById('peak-mini-bar'), bar_cpu: document.getElementById('cpu-mini-bar'), bar_ram: document.getElementById('ram-mini-bar'), log: document.getElementById('log'), rangeSelector: document.getElementById('range-selector'), frateSelector: document.getElementById('frate-selector'), sensitivitySlider: document.getElementById('sensitivity-slider'), sensitivityValue: document.getElementById('sensitivity-value'), numChirpsSlider: document.getElementById('num-chirps-slider'), numChirpsValue: document.getElementById('num-chirps-value'), themeToggle: document.getElementById('theme-toggle'), langToggle: document.getElementById('lang-toggle'), holdToggle: document.getElementById('hold-toggle'), plotCanvas: document.getElementById('plot-canvas'), savePlotBtn: document.getElementById('save-plot-btn') };
+            let maxDistanceCm = 800, maxSpeedMs = 3, maxPeak = 10, langDict = {}, lastValidData = null;
             const rangePresets = __RANGE_PRESETS__, defaultRange = "__DEFAULT_RANGE_KEY__";
             const frameRates = __FRAME_RATES__, defaultFrameRate = __DEFAULT_FRAME_RATE__, defaultNumChirps = __DEFAULT_NUM_CHIRPS__;
             const plotCtx = ui.plotCanvas.getContext('2d');
-            
+            const colors = { static: 'var(--color-static)', approaching: 'var(--color-approaching)', receding: 'var(--color-receding)'};
+
             async function setLanguage(lang) {
                 try {
                     const response = await fetch(`/lang/${lang}`);
                     langDict = await response.json();
-                    document.querySelectorAll('[data-lang]').forEach(el => { const key = el.getAttribute('data-lang'); if (langDict[key]) el.textContent = langDict[key]; });
+                    document.querySelectorAll('[data-lang]').forEach(el => {
+                        const key = el.getAttribute('data-lang');
+                        if (langDict[key]) el.textContent = langDict[key];
+                    });
                     document.documentElement.lang = lang; localStorage.setItem('language', lang);
                 } catch (e) { console.error("Could not set language", e); }
             }
             ui.langToggle.addEventListener('click', () => { setLanguage(document.documentElement.lang === 'en' ? 'cz' : 'en'); });
-
             function applyTheme(theme) { document.body.classList.toggle('dark-mode', theme === 'dark'); }
             ui.themeToggle.addEventListener('click', () => { const newTheme = document.body.classList.contains('dark-mode') ? 'light' : 'dark'; localStorage.setItem('theme', newTheme); applyTheme(newTheme); });
             
-            rangePresets.forEach(key => { const option = document.createElement('option'); option.value = key; option.textContent = key; if (key === defaultRange) option.selected = true; ui.rangeSelector.appendChild(option); });
-            frameRates.forEach(rate => { const option = document.createElement('option'); option.value = rate; option.textContent = rate + ' Hz'; if (rate === defaultFrameRate) option.selected = true; ui.frateSelector.appendChild(option); });
+            rangePresets.forEach(key => {
+                const option = document.createElement('option'); option.value = key; option.textContent = key;
+                if (key === defaultRange) option.selected = true;
+                ui.rangeSelector.appendChild(option);
+            });
+            frameRates.forEach(rate => {
+                const option = document.createElement('option'); option.value = rate; option.textContent = rate + ' Hz';
+                if (rate === defaultFrameRate) option.selected = true;
+                ui.frateSelector.appendChild(option);
+            });
             ui.numChirpsSlider.value = defaultNumChirps; ui.numChirpsValue.textContent = defaultNumChirps;
 
             function sendConfig(ws) {
@@ -232,50 +222,24 @@ HTML_CONTENT = """
                 const rangeKey = ui.rangeSelector.value, frate = parseInt(ui.frateSelector.value, 10), sensitivity = parseFloat(ui.sensitivitySlider.value), num_chirps = parseInt(ui.numChirpsSlider.value, 10);
                 const rangeValueStr = rangeKey.split('m')[0].replace(',', '.');
                 maxDistanceCm = parseFloat(rangeValueStr) * 100;
-                ui.axisMid.textContent = (maxDistanceCm / 2).toFixed(0) + 'cm';
-                ui.axisMax.textContent = maxDistanceCm.toFixed(0) + 'cm';
                 ws.send(JSON.stringify({ action: 'reconfigure', range_key: rangeKey, frate: frate, sensitivity: sensitivity, num_chirps: num_chirps }));
             }
             
             function drawPlot(history) {
                 const w = ui.plotCanvas.width, h = ui.plotCanvas.height;
                 const isDarkMode = document.body.classList.contains('dark-mode');
-                const colors = { static: getComputedStyle(document.documentElement).getPropertyValue('--color-static'), approaching: getComputedStyle(document.documentElement).getPropertyValue('--color-approaching'), receding: getComputedStyle(document.documentElement).getPropertyValue('--color-receding') };
-                
                 plotCtx.fillStyle = isDarkMode ? '#1e1e1e' : '#ffffff';
                 plotCtx.fillRect(0, 0, w, h);
-                plotCtx.lineWidth = 0.5;
-                plotCtx.strokeStyle = isDarkMode ? '#555' : '#ccc';
-                plotCtx.fillStyle = isDarkMode ? '#adb5bd' : '#6c757d';
-                plotCtx.font = "12px sans-serif";
-                
-                const y_padding = 30, x_padding_right = 10;
-                plotCtx.beginPath(); plotCtx.moveTo(y_padding, 0); plotCtx.lineTo(y_padding, h-20); plotCtx.stroke();
-                plotCtx.textAlign = "right"; plotCtx.textBaseline = "middle";
-                [0, 0.5, 1].forEach(p => {
-                    const y = h - 20 - (p * (h-20));
-                    plotCtx.fillText((p * maxDistanceCm).toFixed(0), y_padding-5, y);
-                });
-
-                const frate = parseInt(ui.frateSelector.value, 10) || 20;
-                const timeSpan = history.length / frate;
-                plotCtx.beginPath(); plotCtx.moveTo(y_padding, h-20); plotCtx.lineTo(w, h-20); plotCtx.stroke();
-                plotCtx.textAlign = "center"; plotCtx.textBaseline = "top";
-                 [0, 0.5, 1].forEach(p => {
-                    const x = y_padding + (p * (w - y_padding - x_padding_right));
-                    plotCtx.fillText(`-${(timeSpan * (1-p)).toFixed(1)}s`, x, h-15);
-                });
-
                 if (!history || history.length < 2) return;
                 plotCtx.lineWidth = 2;
                 for (let i = 1; i < history.length; i++) {
                     const [y1, dir1] = history[i-1], [y2, dir2] = history[i];
-                    const x1 = y_padding + (i-1)/(history.length-1)*(w-y_padding-x_padding_right), x2 = y_padding + i/(history.length-1)*(w-y_padding-x_padding_right);
-                    const v1 = (h-20) - (y1/maxDistanceCm)*(h-20), v2 = (h-20) - (y2/maxDistanceCm)*(h-20);
+                    const x1 = (i-1)/(history.length-1)*w, x2 = i/(history.length-1)*w;
+                    const v1 = h - (y1/maxDistanceCm)*h, v2 = h - (y2/maxDistanceCm)*h;
                     let dirClass = 'static';
                     if(dir2 === 'Přibližování' || dir2 === 'Approaching') dirClass = 'approaching';
                     else if(dir2 === 'Vzdalování' || dir2 === 'Receding') dirClass = 'receding';
-                    plotCtx.strokeStyle = colors[dirClass];
+                    plotCtx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue(`--color-${dirClass}`);
                     plotCtx.beginPath(); plotCtx.moveTo(x1,v1); plotCtx.lineTo(x2,v2); plotCtx.stroke();
                 }
             }
@@ -287,7 +251,7 @@ HTML_CONTENT = """
                 ui.status.className = data.status === 'connected' ? 'status-connected' : 'status-disconnected';
                 
                 const isDataValid = data.status === 'connected' && data.peak > 0;
-                const displayData = isDataValid ? data : (ui.holdToggle.checked && lastValidData) ? lastValidData : data;
+                const displayData = (isDataValid) ? data : (ui.holdToggle.checked && lastValidData) ? lastValidData : data;
 
                 if(isDataValid) { lastValidData = data; } 
                 else if(ui.holdToggle.checked && lastValidData) {
@@ -302,21 +266,19 @@ HTML_CONTENT = """
                     ui.peak.textContent = displayData.peak.toFixed(4);
                     ui.sensor_uptime.textContent = isDataValid ? data.sensor_uptime : (lastValidData ? lastValidData.sensor_uptime : '---');
                     ui.cpu.textContent = data.cpu_percent.toFixed(1);
-                    ui.ram.textContent = data.ram_mb.toFixed(1);
-
-                    ui.min_dist.textContent = displayData.min_dist_cm.toFixed(1); ui.max_dist.textContent = displayData.max_dist_cm.toFixed(1);
-                    ui.min_speed.textContent = displayData.min_speed_ms.toFixed(2); ui.max_speed.textContent = displayData.max_speed_ms.toFixed(2);
-                    ui.min_peak.textContent = displayData.min_peak.toFixed(4); ui.max_peak.textContent = displayData.max_peak.toFixed(4);
+                    ui.ram.textContent = data.ram_percent.toFixed(1);
 
                     const dist_p = Math.min(100, Math.max(0, (displayData.distance_cm / maxDistanceCm) * 100));
                     const speed_p = Math.min(100, Math.max(0, (Math.abs(displayData.speed_ms) / maxSpeedMs) * 100));
                     const peak_p = Math.min(100, Math.max(0, (displayData.peak / maxPeak) * 100));
                     
-                    ui.bar_dist.style.width = `${dist_p}%`; ui.bar_speed.style.width = `${speed_p}%`;
-                    ui.bar_peak.style.width = `${peak_p}%`; ui.bar_cpu.style.width = `${data.cpu_percent}%`;
-                    ui.bar_ram.style.width = `${Math.min(100, data.ram_mb / 256 * 100)}%`;
+                    ui.bar_dist.style.width = `${dist_p}%`;
+                    ui.bar_speed.style.width = `${speed_p}%`;
+                    ui.bar_peak.style.width = `${peak_p}%`;
+                    ui.bar_cpu.style.width = `${data.cpu_percent}%`;
+                    ui.bar_ram.style.width = `${data.ram_percent}%`;
 
-                    const barsToColor = [ui.bar, ui.bar_dist, ui.bar_speed, ui.bar_peak];
+                    const barsToColor = [ui.bar_dist, ui.bar_speed, ui.bar_peak];
                     barsToColor.forEach(el => el.classList.remove('approaching', 'receding', 'static'));
                     let cssClass = 'static';
                     if(displayData.direction === 'Přibližování' || displayData.direction === 'Approaching') cssClass = 'approaching';
@@ -324,7 +286,7 @@ HTML_CONTENT = """
                     barsToColor.forEach(el => el.classList.add(cssClass));
                 }
                 
-                if(!isPlotPaused) { drawPlot(data.history); }
+                drawPlot(data.history);
             }
 
             function connect() {
@@ -337,14 +299,19 @@ HTML_CONTENT = """
                 ui.numChirpsSlider.onchange = () => sendConfig(ws);
                 ui.sensitivitySlider.oninput = () => { ui.sensitivityValue.textContent = ui.sensitivitySlider.value; };
                 ui.sensitivitySlider.onchange = () => sendConfig(ws);
-                ui.savePlotBtn.onclick = () => { const link = document.createElement('a'); link.download = `radar_plot_${new Date().toISOString()}.jpeg`; link.href = ui.plotCanvas.toDataURL('image/jpeg', 0.9); link.click(); };
-                ui.pausePlotBtn.onclick = () => { isPlotPaused = !isPlotPaused; ui.pausePlotBtn.textContent = isPlotPaused ? (langDict.resume_plot || 'Resume Plot') : (langDict.pause_plot || 'Pause Plot'); };
+                ui.savePlotBtn.onclick = () => {
+                    const link = document.createElement('a');
+                    link.download = `radar_plot_${new Date().toISOString()}.jpeg`;
+                    link.href = ui.plotCanvas.toDataURL('image/jpeg', 0.9);
+                    link.click();
+                };
 
                 function addLog(msg, type = 'info') {
                     const entry = document.createElement('div');
                     entry.className = `log-entry ${type}`;
                     entry.textContent = msg;
                     ui.log.prepend(entry);
+                    if (ui.log.children.length > 100) ui.log.removeChild(ui.log.lastChild);
                 }
 
                 ws.onmessage = (event) => {
@@ -366,6 +333,7 @@ HTML_CONTENT = """
 </body>
 </html>
 """
+
 class ConnectionManager:
     def __init__(self): self.active_connections: list[WebSocket] = []
     async def connect(self, websocket: WebSocket): await websocket.accept(); self.active_connections.append(websocket)
@@ -412,7 +380,6 @@ class DopplerAlgo:
 shared_state = {"frate": DEFAULT_FRAME_RATE, "range_key": DEFAULT_RANGE_KEY, "peak_threshold": DEFAULT_PEAK_THRESHOLD, "num_chirps": DEFAULT_NUM_CHIRPS, "reconfigure": True }
 state_lock = threading.Lock()
 data_history = deque(maxlen=200)
-process = psutil.Process(os.getpid())
 
 def log_and_broadcast(level, message, loop):
     log_message = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level.upper()}] {message}"
@@ -425,14 +392,12 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
     def broadcast_sync(message: dict):
         program_uptime = datetime.now() - START_TIME
         message['program_uptime'] = str(program_uptime).split('.')[0]
-        with state_lock: message['history'] = list(data_history)
+        with state_lock:
+            message['history'] = list(data_history)
         if not loop.is_closed(): asyncio.run_coroutine_threadsafe(manager.broadcast(message), loop)
     
     time.sleep(1)
     smoothed_distance, smoothed_speed, device, connection_start_time = None, None, None, None
-    stats = {}
-    def reset_stats(): return { 'min_dist_cm': None, 'max_dist_cm': 0, 'min_speed_ms': None, 'max_speed_ms': 0, 'min_peak': None, 'max_peak': 0 }
-    stats = reset_stats()
         
     while True:
         try:
@@ -443,7 +408,6 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
                         try: device.stop_acquisition()
                         except Exception: pass
                     device = None; shared_state["reconfigure"] = False
-                    stats = reset_stats()
 
             if device is None:
                 log_and_broadcast("info", "Pokus o připojení k radaru...", loop)
@@ -451,8 +415,9 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
                 connection_start_time = datetime.now()
                 log_and_broadcast("success", f"Radar připojen: {device.get_sensor_type()}.", loop)
                 with state_lock:
-                    frate, range_key, num_chirps = shared_state['frate'], shared_state['range_key'], shared_state['num_chirps']
-                
+                    frate = shared_state['frate']
+                    range_key = shared_state['range_key']
+                    num_chirps = shared_state['num_chirps']
                 log_and_broadcast("info", f"Konfigurace: {range_key} @ {frate} Hz, Chirps: {num_chirps}", loop)
                 max_range, range_res = RANGE_PRESETS[range_key]
                 metrics = FmcwMetrics(range_resolution_m=range_res, max_range_m=max_range, max_speed_m_s=3, speed_resolution_m_s=0.2, center_frequency_Hz=60_750_000_000)
@@ -478,7 +443,7 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
             sensor_uptime = datetime.now() - connection_start_time
             data_payload['sensor_uptime'] = str(sensor_uptime).split('.')[0]
             data_payload['cpu_percent'] = psutil.cpu_percent()
-            data_payload['ram_mb'] = process.memory_info().rss / (1024 * 1024)
+            data_payload['ram_percent'] = psutil.virtual_memory().percent
             direction = "---"
             
             if peak_value >= current_peak_threshold:
@@ -490,32 +455,20 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
                 if abs(smoothed_speed) < metrics.speed_resolution_m_s: direction = "Statický"
                 elif smoothed_speed < 0: direction = "Přibližování"
                 else: direction = "Vzdalování"
-                
-                stats['max_dist_cm'] = max(stats['max_dist_cm'], smoothed_distance)
-                stats['max_speed_ms'] = max(stats['max_speed_ms'], smoothed_speed)
-                stats['max_peak'] = max(stats['max_peak'], peak_value)
-                if stats['min_dist_cm'] is None: stats['min_dist_cm'] = smoothed_distance
-                else: stats['min_dist_cm'] = min(stats['min_dist_cm'], smoothed_distance)
-                if stats['min_speed_ms'] is None: stats['min_speed_ms'] = smoothed_speed
-                else: stats['min_speed_ms'] = min(stats['min_speed_ms'], smoothed_speed)
-                if stats['min_peak'] is None: stats['min_peak'] = peak_value
-                else: stats['min_peak'] = min(stats['min_peak'], peak_value)
-                
-                data_payload.update({"status": "connected", "distance_cm": smoothed_distance, "speed_ms": smoothed_speed, "direction": direction, "peak": peak_value, **stats})
+                data_payload.update({"status": "connected", "distance_cm": smoothed_distance, "speed_ms": smoothed_speed, "direction": direction, "peak": peak_value})
                 log_string = (f"Vzdálenost: {data_payload['distance_cm']:.1f}cm, Rychlost: {data_payload['speed_ms']:+.2f}m/s, Směr: {direction}, Peak: {peak_value:.4f}")
                 log_and_broadcast("data", log_string, loop)
                 with state_lock: data_history.append((smoothed_distance, direction))
             else:
-                data_payload.update({"status": "connected", "distance_cm": 0.0, "speed_ms": 0.0, "direction": "---", "peak": 0.0, **stats})
+                data_payload.update({"status": "connected", "distance_cm": 0.0, "speed_ms": 0.0, "direction": "---", "peak": 0.0})
                 with state_lock: data_history.append((0, "---"))
 
             broadcast_sync(data_payload)
         
         except Exception as e:
             log_and_broadcast("error", f"Smyčka radaru selhala: {e}", loop)
-            broadcast_sync({"status": "waiting_for_device", "program_uptime": str(datetime.now() - START_TIME).split('.')[0], "cpu_percent": psutil.cpu_percent(), "ram_mb": process.memory_info().rss / (1024 * 1024)})
+            broadcast_sync({"status": "waiting_for_device", "program_uptime": str(datetime.now() - START_TIME).split('.')[0], "cpu_percent": psutil.cpu_percent(), "ram_percent": psutil.virtual_memory().percent})
             smoothed_distance, smoothed_speed, device, connection_start_time = None, None, None, None
-            stats = reset_stats()
             time.sleep(3)
 
 # ===========================================================================
@@ -571,9 +524,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     shared_state['num_chirps'] = data['num_chirps']; reconfigure_needed = True
                 if 'sensitivity' in data:
                     shared_state['peak_threshold'] = data['sensitivity']
+                
                 if reconfigure_needed:
                     shared_state['reconfigure'] = True
                     log_and_broadcast("info", f"Přijata nová konfigurace: {shared_state}", loop)
+
     except (WebSocketDisconnect, asyncio.CancelledError):
         manager.disconnect(websocket)
 
@@ -585,6 +540,7 @@ if __name__ == '__main__':
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host IP to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     cli_args = parser.parse_args()
+    
     try:
         uvicorn.run(app, host=cli_args.host, port=cli_args.port)
     except KeyboardInterrupt:

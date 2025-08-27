@@ -1,3 +1,4 @@
+import argparse
 import sys
 import numpy as np
 from scipy import signal
@@ -8,11 +9,19 @@ import threading
 import uvicorn
 import base64
 import json
-import argparse
+import os
+import io
+from collections import deque
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from starlette.websockets import WebSocketDisconnect
+from starlette.responses import StreamingResponse
+
+# --- NEW: Import pro vykreslování grafů ---
+import matplotlib
+matplotlib.use('Agg') # Použití neinteraktivního backendu pro běh na serveru
+import matplotlib.pyplot as plt
 
 from ifxradarsdk import get_version_full
 from ifxradarsdk.fmcw import DeviceFmcw
@@ -23,48 +32,25 @@ from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwMetrics
 # ===========================================================================
 EMA_ALPHA = 0.4
 DEFAULT_PEAK_THRESHOLD = 0.2
+DEFAULT_RANGE_KEY = "8m (Výchozí)"
+DEFAULT_FRAME_RATE = 20
+START_TIME = datetime.now()
 
 RANGE_PRESETS = {
-    "0.5m (Vysoká přesnost)": (0.5, 0.02), "1.6m (Standardní)": (1.6, 0.05),
+    "0.5m (Vysoká přesnost)": (0.5, 0.05), "1.6m (Standardní)": (1.6, 0.05),
     "3m (Místnost)": (3.0, 0.10), "5m": (5.0, 0.15),
     "8m (Výchozí)": (8.0, 0.20), "10m": (10.0, 0.25),
     "12m": (12.0, 0.30), "15m (Maximální dosah)": (15.0, 0.40),
 }
-DEFAULT_RANGE_KEY = "8m (Výchozí)"
-
 FRAME_RATES_HZ = [5, 10, 20, 30, 40, 50, 60]
-DEFAULT_FRAME_RATE = 20
-START_TIME = datetime.now()
 # ===========================================================================
 
 # ===========================================================================
-# --- PŘEKLADY A TEXTY PRO WEB ---
+# --- PŘEKLADY ---
 # ===========================================================================
 LANGUAGES = {
-    "en": {
-        "title": "Radar Live View", "status_connecting": "Connecting...",
-        "status_connected_server": "Server Connected", "status_waiting": "Waiting for Device...",
-        "status_reconfiguring": "Reconfiguring Radar...", "status_connected_device": "Connected",
-        "status_disconnected_server": "SERVER DISCONNECTED - Reconnecting...",
-        "header": "Live Radar Feed", "range_label": "Range:", "frate_label": "Frequency:",
-        "sensitivity_label": "Sensitivity:", "distance": "Distance", "speed": "Speed",
-        "direction": "Direction", "peak_signal": "Peak Signal", "sensor_uptime": "Sensor Uptime",
-        "program_uptime": "Program Uptime", "log_header": "Diagnostic Log",
-        "static": "Static", "approaching": "Approaching", "receding": "Receding",
-        "toggle_theme": "Toggle Theme", "lang_toggle": "Česky", "hold_label": "Hold Last Value"
-    },
-    "cz": {
-        "title": "Radar Live Vizualizace", "status_connecting": "Připojování...",
-        "status_connected_server": "Server připojen", "status_waiting": "Čekání na zařízení...",
-        "status_reconfiguring": "Rekonfigurace radaru...", "status_connected_device": "Připojeno",
-        "status_disconnected_server": "SERVER ODPOJEN - Pokus o znovupřipojení...",
-        "header": "Živá data z radaru", "range_label": "Rozsah:", "frate_label": "Frekvence:",
-        "sensitivity_label": "Citlivost:", "distance": "Vzdálenost", "speed": "Rychlost",
-        "direction": "Směr", "peak_signal": "Síla signálu", "sensor_uptime": "Doba připojení",
-        "program_uptime": "Doba běhu", "log_header": "Diagnostický Log",
-        "static": "Statický", "approaching": "Přibližování", "receding": "Vzdalování",
-        "toggle_theme": "Přepnout vzhled", "lang_toggle": "English", "hold_label": "Podržet poslední hodnotu"
-    }
+    "en": {"title": "Radar Live View", "status_connecting": "Connecting...", "status_connected_server": "Server Connected", "status_waiting": "Waiting for Device...", "status_reconfiguring": "Reconfiguring Radar...", "status_connected_device": "Connected", "status_disconnected_server": "SERVER DISCONNECTED - Reconnecting...", "header": "Live Radar Feed", "range_label": "Range:", "frate_label": "Frequency:", "sensitivity_label": "Sensitivity:", "distance": "Distance", "speed": "Speed", "direction": "Direction", "peak_signal": "Peak Signal", "sensor_uptime": "Sensor Uptime", "program_uptime": "Program Uptime", "log_header": "Diagnostic Log", "static": "Static", "approaching": "Approaching", "receding": "Receding", "toggle_theme": "Toggle Theme", "lang_toggle": "Česky", "hold_label": "Hold Last Value"},
+    "cz": {"title": "Radar Live Vizualizace", "status_connecting": "Připojování...", "status_connected_server": "Server připojen", "status_waiting": "Čekání na zařízení...", "status_reconfiguring": "Rekonfigurace radaru...", "status_connected_device": "Připojeno", "status_disconnected_server": "SERVER ODPOJEN - Pokus o znovupřipojení...", "header": "Živá data z radaru", "range_label": "Rozsah:", "frate_label": "Frekvence:", "sensitivity_label": "Citlivost:", "distance": "Vzdálenost", "speed": "Rychlost", "direction": "Směr", "peak_signal": "Síla signálu", "sensor_uptime": "Doba připojení", "program_uptime": "Doba běhu", "log_header": "Diagnostický Log", "static": "Statický", "approaching": "Přibližování", "receding": "Vzdalování", "toggle_theme": "Přepnout vzhled", "lang_toggle": "English", "hold_label": "Podržet poslední hodnotu"}
 }
 # ===========================================================================
 
@@ -114,11 +100,10 @@ HTML_CONTENT = """
         .metric { background: var(--secondary-bg-color); padding: 1rem; border-radius: 6px; text-align: center; }
         .metric-label { font-size: 0.9rem; color: var(--secondary-text-color); }
         .metric-value { font-size: 1.8rem; font-weight: bold; color: var(--text-color); }
-        .mini-bargraph-container { width: 100%; height: 8px; background-color: var(--border-color); border-radius: 4px; margin-top: 0.75rem; overflow: hidden; }
-        .mini-bargraph-bar { height: 100%; width: 0%; border-radius: 4px; transition: width 0.1s linear, background-color 0.3s; }
-        .bargraph-container { width: 100%; height: 40px; background-color: var(--secondary-bg-color); border-radius: 6px; margin-top: 1rem; overflow: hidden; border: 1px solid var(--border-color); }
-        .bargraph-bar { height: 100%; width: 0%; border-radius: 6px; transition: width 0.1s linear, background-color 0.3s; }
-        .bargraph-axis { display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--secondary-text-color); padding: 0 5px; margin-top: 5px; }
+        .mini-bargraph-container { width: 100%; height: 10px; background-color: var(--border-color); border-radius: 5px; margin-top: 0.75rem; overflow: hidden; }
+        .mini-bargraph-bar { height: 100%; width: 0%; border-radius: 5px; transition: width 0.1s linear, background-color 0.3s; }
+        #plot-container { margin-top: 1.5rem; }
+        #plot { width: 100%; border-radius: 6px; border: 1px solid var(--border-color); }
         #log-container { display: flex; flex-direction: column; height: 100%; }
         #log-header { margin-top: 0; }
         #log { flex: 1; background: var(--secondary-bg-color); color: var(--text-color); padding: 1rem; border-radius: 6px; overflow-y: scroll; font-family: "SF Mono", "Menlo", monospace; font-size: 0.8rem; text-align: left; }
@@ -127,6 +112,10 @@ HTML_CONTENT = """
         .approaching { background-color: var(--color-approaching); }
         .receding { background-color: var(--color-receding); }
         .static { background-color: var(--color-static); }
+        #theme-toggle { position: absolute; top: 15px; right: 15px; background: var(--secondary-bg-color); border: 1px solid var(--border-color); border-radius: 50%; width: 40px; height: 40px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        #theme-toggle svg { width: 20px; height: 20px; fill: var(--icon-fill); }
+        .dark-mode .sun-icon { display: block; } .dark-mode .moon-icon { display: none; }
+        .sun-icon { display: none; } .moon-icon { display: block; }
     </style>
 </head>
 <body>
@@ -138,7 +127,7 @@ HTML_CONTENT = """
             </div>
             <div class="top-controls">
                 <button id="lang-toggle" data-lang="lang_toggle">Česky</button>
-                <button id="theme-toggle" data-lang="toggle_theme" title="Toggle Theme">Toggle</button>
+                <button id="theme-toggle" data-lang="toggle_theme" title="Toggle Theme"></button>
             </div>
         </header>
         <div class="content-area">
@@ -170,8 +159,9 @@ HTML_CONTENT = """
                     <div class="metric"><div class="metric-label" data-lang="sensor_uptime">Sensor Uptime</div><span id="sensor_uptime" class="metric-value">---</span></div>
                     <div class="metric"><div class="metric-label" data-lang="program_uptime">Program Uptime</div><span id="program_uptime" class="metric-value">---</span></div>
                 </div>
-                <div class="bargraph-container"><div id="distance-bar" class="bargraph-bar"></div></div>
-                <div class="bargraph-axis"><span>0cm</span><span id="axis-mid"></span><span id="axis-max"></span></div>
+                <div id="plot-container">
+                    <img id="plot" src="" alt="Live Plot"/>
+                </div>
             </div>
             <div class="right-panel" id="log-container">
                 <h2 id="log-header" data-lang="log_header">Diagnostic Log</h2>
@@ -187,16 +177,15 @@ HTML_CONTENT = """
                 speed: document.getElementById('speed'), direction: document.getElementById('direction'),
                 peak: document.getElementById('peak'), sensor_uptime: document.getElementById('sensor_uptime'),
                 program_uptime: document.getElementById('program_uptime'),
-                bar: document.getElementById('distance-bar'),
                 bar_dist: document.getElementById('distance-mini-bar'),
                 bar_speed: document.getElementById('speed-mini-bar'),
                 bar_peak: document.getElementById('peak-mini-bar'),
+                plot: document.getElementById('plot'),
                 log: document.getElementById('log'), rangeSelector: document.getElementById('range-selector'),
                 frateSelector: document.getElementById('frate-selector'),
                 sensitivitySlider: document.getElementById('sensitivity-slider'),
                 sensitivityValue: document.getElementById('sensitivity-value'),
                 themeToggle: document.getElementById('theme-toggle'), langToggle: document.getElementById('lang-toggle'),
-                axisMid: document.getElementById('axis-mid'), axisMax: document.getElementById('axis-max'),
                 holdToggle: document.getElementById('hold-toggle')
             };
             let maxDistanceCm = 800, maxSpeedMs = 3, maxPeak = 10, langDict = {}, lastValidData = null;
@@ -247,11 +236,9 @@ HTML_CONTENT = """
                 const sensitivity = parseFloat(ui.sensitivitySlider.value);
                 const rangeValueStr = rangeKey.split('m')[0].replace(',', '.');
                 maxDistanceCm = parseFloat(rangeValueStr) * 100;
-                ui.axisMid.textContent = (maxDistanceCm / 2).toFixed(0) + 'cm';
-                ui.axisMax.textContent = maxDistanceCm.toFixed(0) + 'cm';
                 ws.send(JSON.stringify({ action: 'reconfigure', range_key: rangeKey, frate: frate, sensitivity: sensitivity }));
             }
-
+            
             function updateUI(data) {
                 ui.program_uptime.textContent = data.program_uptime || '---';
                 const statusKey = (data.status || 'connecting').replace(/ /g, '_');
@@ -259,13 +246,10 @@ HTML_CONTENT = """
                 ui.status.className = data.status === 'connected' ? 'status-connected' : 'status-disconnected';
                 
                 const isDataValid = data.status === 'connected' && data.peak > 0;
-
                 const displayData = (isDataValid) ? data : (ui.holdToggle.checked && lastValidData) ? lastValidData : data;
 
-                if(isDataValid) {
-                    lastValidData = data;
-                } else if(ui.holdToggle.checked && lastValidData) {
-                    // update time fields on held data
+                if(isDataValid) { lastValidData = data; } 
+                else if(ui.holdToggle.checked && lastValidData) {
                     lastValidData.program_uptime = data.program_uptime;
                     lastValidData.sensor_uptime = "0:00:00";
                 }
@@ -280,12 +264,11 @@ HTML_CONTENT = """
                 const speed_p = Math.min(100, Math.max(0, (Math.abs(displayData.speed_ms) / maxSpeedMs) * 100));
                 const peak_p = Math.min(100, Math.max(0, (displayData.peak / maxPeak) * 100));
                 
-                ui.bar.style.width = `${dist_p}%`;
                 ui.bar_dist.style.width = `${dist_p}%`;
                 ui.bar_speed.style.width = `${speed_p}%`;
                 ui.bar_peak.style.width = `${peak_p}%`;
 
-                const barsToColor = [ui.bar, ui.bar_dist, ui.bar_speed, ui.bar_peak];
+                const barsToColor = [ui.bar_dist, ui.bar_speed, ui.bar_peak];
                 barsToColor.forEach(el => el.classList.remove('approaching', 'receding', 'static'));
                 let cssClass = 'static';
                 if(displayData.direction === 'Přibližování' || displayData.direction === 'Approaching') cssClass = 'approaching';
@@ -295,7 +278,7 @@ HTML_CONTENT = """
 
             function connect() {
                 const ws = new WebSocket(`ws://${window.location.host}/ws`);
-
+                
                 ws.onopen = () => { setLanguage(localStorage.getItem('language') || 'en').then(() => sendConfig(ws)); };
                 ui.rangeSelector.onchange = () => sendConfig(ws);
                 ui.frateSelector.onchange = () => sendConfig(ws);
@@ -323,13 +306,20 @@ HTML_CONTENT = """
             }
             
             applyTheme(localStorage.getItem('theme') || 'light');
+            
+            // --- NEW: Start live plot updater ---
+            setInterval(() => {
+                ui.plot.src = "/plot.jpeg?" + new Date().getTime();
+            }, 200); // Update plot 5 times per second
+
             connect();
         })();
     </script>
 </body>
 </html>
 """
-FAVICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAVUlEQVRYw+3VwQkAIBAEwP3/p5xABCKdG1pr1fB00QYxJgCIiAgAEREBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABF9cgILAEJMfX28AAAAAElFTSuQmCC"
+# --- MODIFIED: Nová favicona ---
+FAVICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAABJklEQVR4nO2WQQ6CMBBEvx/dDDfTwh3cR+h54D7Ok0h2Z+i5Y2/oKk6lBCRIaEppU3pA0+f9PTM9sP3/LgB4A7ADc2EMAl0GIJNW07a9A+5aGgBBCHmEiBERAUBEBAAiIgAiIgAiIgAiIgAiIgAiIgAiIgAiIgDqdseA3W4nSSaTUSqV+g0wGAwiCEII4dI0rRkMhsHGGF5/bdt+CA8Mh8NQTdO8ATg4ODg0mUxyAcYYKJVKhEIh9fUvQghuHMPh4eFDQ0ND3gFc143+/v7T0dHxP/cDwF+g83g87g8ODg4MBoPDw8PDf0xPT9/c3Nw8MjIyMj4+3t/b2/t3AHDW7/ffAEZGRkZHR0dHR0dGRkZGJiYm3gBcfwEFXchKqX2rwwAAAABJRU5ErkJggg=="
 
 class ConnectionManager:
     def __init__(self): self.active_connections: list[WebSocket] = []
@@ -342,6 +332,11 @@ class ConnectionManager:
             except Exception:
                 if connection in self.active_connections: self.active_connections.remove(connection)
 manager = ConnectionManager()
+
+# --- NEW: Globální proměnné pro Watchdog a historii grafu ---
+last_frame_time = datetime.now()
+watchdog_lock = threading.Lock()
+data_history = deque(maxlen=200) # Historie pro 200 posledních měření
 # ===========================================================================
 
 # ===========================================================================
@@ -374,16 +369,16 @@ class DopplerAlgo:
 # ===========================================================================
 # Vlákno pro měření radaru
 # ===========================================================================
-shared_state = { "frate": DEFAULT_FRAME_RATE, "range_key": DEFAULT_RANGE_KEY, "peak_threshold": DEFAULT_PEAK_THRESHOLD, "reconfigure": True }
+shared_state = {"frate": DEFAULT_FRAME_RATE, "range_key": DEFAULT_RANGE_KEY, "peak_threshold": DEFAULT_PEAK_THRESHOLD, "reconfigure": True }
 state_lock = threading.Lock()
 
 def log_and_broadcast(level, message, loop):
-    log_message = f"[{datetime.now():%Y-%m-%d %H:%M:%S.%f}] [{level.upper()}] {message}"
+    log_message = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level.upper()}] {message}"
     print(log_message)
-    if not loop.is_closed():
-        asyncio.run_coroutine_threadsafe(manager.broadcast({"type": "log", "level": level, "message": log_message}), loop)
+    if not loop.is_closed(): asyncio.run_coroutine_threadsafe(manager.broadcast({"type": "log", "level": level, "message": log_message}), loop)
 
 def run_radar_loop(loop: asyncio.AbstractEventLoop):
+    global last_frame_time, data_history
     def broadcast_sync(message: dict):
         program_uptime = datetime.now() - START_TIME
         message['program_uptime'] = str(program_uptime).split('.')[0]
@@ -407,11 +402,9 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
                 device = DeviceFmcw()
                 connection_start_time = datetime.now()
                 log_and_broadcast("success", f"Radar připojen: {device.get_sensor_type()}.", loop)
-
                 with state_lock:
                     frate = shared_state['frate']
                     range_key = shared_state['range_key']
-                
                 log_and_broadcast("info", f"Konfigurace: {range_key} @ {frate} Hz", loop)
                 max_range, range_res = RANGE_PRESETS[range_key]
                 metrics = FmcwMetrics(range_resolution_m=range_res, max_range_m=max_range, max_speed_m_s=3, speed_resolution_m_s=0.2, center_frequency_Hz=60_750_000_000)
@@ -427,6 +420,8 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
                 algo = DopplerAlgo(chirp.num_samples, chirp_loop.loop.num_repetitions, metrics)
             
             frame_contents = device.get_next_frame()
+            with watchdog_lock: last_frame_time = datetime.now()
+            
             antenna_samples = frame_contents[0][0, :, :]
             distance_m, speed_ms, peak_value = algo.compute_doppler_map(antenna_samples)
             
@@ -435,6 +430,7 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
             data_payload = {}
             sensor_uptime = datetime.now() - connection_start_time
             data_payload['sensor_uptime'] = str(sensor_uptime).split('.')[0]
+            direction = "---"
 
             if peak_value >= current_peak_threshold:
                 distance_cm = distance_m * 100
@@ -450,6 +446,8 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
                 data_payload.update({"status": "connected", "distance_cm": 0.0, "speed_ms": 0.0, "direction": "---", "peak": 0.0})
             
             broadcast_sync(data_payload)
+            with watchdog_lock:
+                data_history.append((data_payload['distance_cm'], direction))
         
         except Exception as e:
             log_and_broadcast("error", f"Smyčka radaru selhala: {e}", loop)
@@ -458,11 +456,28 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
             time.sleep(3)
 
 # ===========================================================================
+# Watchdog vlákno
+# ===========================================================================
+def watchdog_thread_func():
+    while True:
+        time.sleep(WATCHDOG_TIMEOUT_S / 2)
+        with watchdog_lock:
+            time_since_last_frame = datetime.now() - last_frame_time
+        if time_since_last_frame.total_seconds() > WATCHDOG_TIMEOUT_S:
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [FATAL] WATCHDOG: Restartuji aplikaci z důvodu zamrznutí radarového vlákna.")
+            os.execv(sys.executable, ['python'] + sys.argv)
+# ===========================================================================
+
+# ===========================================================================
 # FastAPI App a Endpoints
 # ===========================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
+    
+    watchdog_thread = threading.Thread(target=watchdog_thread_func, daemon=True)
+    watchdog_thread.start()
+
     radar_thread = threading.Thread(target=run_radar_loop, args=(loop,), daemon=True)
     radar_thread.start()
     yield
@@ -487,9 +502,47 @@ async def get():
 async def get_lang(lang_code: str):
     return LANGUAGES.get(lang_code, LANGUAGES["en"])
 
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return Response(base64.b64decode(FAVICON_B64), media_type="image/x-icon")
+# --- NEW: Endpoint pro vykreslování grafu ---
+@app.get("/plot.jpeg")
+async def get_plot():
+    with watchdog_lock:
+        history = list(data_history)
+        with state_lock:
+            range_key = shared_state['range_key']
+    
+    max_range_m, _ = RANGE_PRESETS[range_key]
+    max_range_cm = max_range_m * 100
+
+    fig, ax = plt.subplots(figsize=(8, 2), dpi=90)
+    fig.patch.set_facecolor('#E9ECEF') # Světlé pozadí
+    ax.set_facecolor('#FFFFFF') # Bílé pozadí grafu
+
+    if document.body.classList.contains('dark-mode'): # Jednoduchá kontrola, lepší řešení by vyžadovalo parametr
+        fig.patch.set_facecolor('#333333')
+        ax.set_facecolor('#1E1E1E')
+        ax.tick_params(colors='white')
+        ax.spines['bottom'].set_color('white')
+        ax.spines['left'].set_color('white')
+
+    ax.set_ylim(0, max_range_cm)
+    ax.set_xlim(0, data_history.maxlen)
+    ax.get_xaxis().set_visible(False)
+    ax.set_ylabel('Vzdálenost (cm)', color='gray')
+
+    colors = {'Přibližování': '#198754', 'Vzdalování': '#dc3545', 'Statický': '#0d6efd', '---': '#6c757d'}
+
+    for i in range(1, len(history)):
+        y1, dir1 = history[i-1]
+        y2, dir2 = history[i]
+        color = colors.get(dir2, '#6c757d')
+        ax.plot([i-1, i], [y1, y2], color=color, linewidth=2)
+        
+    buf = io.BytesIO()
+    fig.savefig(buf, format='jpeg', bbox_inches='tight', pad_inches=0.1)
+    plt.close(fig)
+    buf.seek(0)
+    
+    return StreamingResponse(buf, media_type="image/jpeg")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -501,18 +554,14 @@ async def websocket_endpoint(websocket: WebSocket):
             with state_lock:
                 reconfigure_needed = False
                 if data.get('range_key') != shared_state.get('range_key'):
-                    shared_state['range_key'] = data['range_key']
-                    reconfigure_needed = True
+                    shared_state['range_key'] = data['range_key']; reconfigure_needed = True
                 if data.get('frate') != shared_state.get('frate'):
-                    shared_state['frate'] = data['frate']
-                    reconfigure_needed = True
+                    shared_state['frate'] = data['frate']; reconfigure_needed = True
                 if 'sensitivity' in data:
                     shared_state['peak_threshold'] = data['sensitivity']
-                
                 if reconfigure_needed:
                     shared_state['reconfigure'] = True
                     log_and_broadcast("info", f"Přijata nová konfigurace: {shared_state}", loop)
-
     except (WebSocketDisconnect, asyncio.CancelledError):
         manager.disconnect(websocket)
 
@@ -524,7 +573,6 @@ if __name__ == '__main__':
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host IP to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     cli_args = parser.parse_args()
-    
     try:
         uvicorn.run(app, host=cli_args.host, port=cli_args.port)
     except KeyboardInterrupt:

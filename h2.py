@@ -14,6 +14,9 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
+# --- NEW: Knihovna pro měření využití systému ---
+import psutil
+
 from ifxradarsdk import get_version_full
 from ifxradarsdk.fmcw import DeviceFmcw
 from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwMetrics
@@ -23,48 +26,25 @@ from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwMetrics
 # ===========================================================================
 EMA_ALPHA = 0.4
 DEFAULT_PEAK_THRESHOLD = 0.2
+DEFAULT_RANGE_KEY = "8m (Výchozí)"
+DEFAULT_FRAME_RATE = 20
+START_TIME = datetime.now()
 
 RANGE_PRESETS = {
-    "0.5m (Vysoká přesnost)": (0.5, 0.02), "1.6m (Standardní)": (1.6, 0.05),
+    "0.5m (Vysoká přesnost)": (0.5, 0.05), "1.6m (Standardní)": (1.6, 0.05),
     "3m (Místnost)": (3.0, 0.10), "5m": (5.0, 0.15),
     "8m (Výchozí)": (8.0, 0.20), "10m": (10.0, 0.25),
     "12m": (12.0, 0.30), "15m (Maximální dosah)": (15.0, 0.40),
 }
-DEFAULT_RANGE_KEY = "8m (Výchozí)"
-
 FRAME_RATES_HZ = [5, 10, 20, 30, 40, 50, 60]
-DEFAULT_FRAME_RATE = 20
-START_TIME = datetime.now()
 # ===========================================================================
 
 # ===========================================================================
-# --- PŘEKLADY A TEXTY PRO WEB ---
+# --- PŘEKLADY ---
 # ===========================================================================
 LANGUAGES = {
-    "en": {
-        "title": "Radar Live View", "status_connecting": "Connecting...",
-        "status_connected_server": "Server Connected", "status_waiting": "Waiting for Device...",
-        "status_reconfiguring": "Reconfiguring Radar...", "status_connected_device": "Connected",
-        "status_disconnected_server": "SERVER DISCONNECTED - Reconnecting...",
-        "header": "Live Radar Feed", "range_label": "Range:", "frate_label": "Frequency:",
-        "sensitivity_label": "Sensitivity:", "distance": "Distance", "speed": "Speed",
-        "direction": "Direction", "peak_signal": "Peak Signal", "sensor_uptime": "Sensor Uptime",
-        "program_uptime": "Program Uptime", "log_header": "Diagnostic Log",
-        "static": "Static", "approaching": "Approaching", "receding": "Receding",
-        "toggle_theme": "Toggle Theme", "lang_toggle": "Česky", "hold_label": "Hold Last Value"
-    },
-    "cz": {
-        "title": "Radar Live Vizualizace", "status_connecting": "Připojování...",
-        "status_connected_server": "Server připojen", "status_waiting": "Čekání na zařízení...",
-        "status_reconfiguring": "Rekonfigurace radaru...", "status_connected_device": "Připojeno",
-        "status_disconnected_server": "SERVER ODPOJEN - Pokus o znovupřipojení...",
-        "header": "Živá data z radaru", "range_label": "Rozsah:", "frate_label": "Frekvence:",
-        "sensitivity_label": "Citlivost:", "distance": "Vzdálenost", "speed": "Rychlost",
-        "direction": "Směr", "peak_signal": "Síla signálu", "sensor_uptime": "Doba připojení",
-        "program_uptime": "Doba běhu", "log_header": "Diagnostický Log",
-        "static": "Statický", "approaching": "Přibližování", "receding": "Vzdalování",
-        "toggle_theme": "Přepnout vzhled", "lang_toggle": "English", "hold_label": "Podržet poslední hodnotu"
-    }
+    "en": {"title": "Radar Live View", "status_connecting": "Connecting...", "status_connected_server": "Server Connected", "status_waiting": "Waiting for Device...", "status_reconfiguring": "Reconfiguring Radar...", "status_connected_device": "Connected", "status_disconnected_server": "SERVER DISCONNECTED - Reconnecting...", "header": "Live Radar Feed", "range_label": "Range:", "frate_label": "Frequency:", "sensitivity_label": "Sensitivity:", "distance": "Distance", "speed": "Speed", "direction": "Direction", "peak_signal": "Peak Signal", "sensor_uptime": "Sensor Uptime", "program_uptime": "Program Uptime", "log_header": "Diagnostic Log", "static": "Static", "approaching": "Approaching", "receding": "Receding", "toggle_theme": "Toggle Theme", "lang_toggle": "Česky", "hold_label": "Hold Last Value", "cpu_usage": "CPU Usage", "ram_usage": "RAM Usage"},
+    "cz": {"title": "Radar Live Vizualizace", "status_connecting": "Připojování...", "status_connected_server": "Server připojen", "status_waiting": "Čekání na zařízení...", "status_reconfiguring": "Rekonfigurace radaru...", "status_connected_device": "Připojeno", "status_disconnected_server": "SERVER ODPOJEN - Pokus o znovupřipojení...", "header": "Živá data z radaru", "range_label": "Rozsah:", "frate_label": "Frekvence:", "sensitivity_label": "Citlivost:", "distance": "Vzdálenost", "speed": "Rychlost", "direction": "Směr", "peak_signal": "Síla signálu", "sensor_uptime": "Doba připojení", "program_uptime": "Doba běhu", "log_header": "Diagnostický Log", "static": "Statický", "approaching": "Přibližování", "receding": "Vzdalování", "toggle_theme": "Přepnout vzhled", "lang_toggle": "English", "hold_label": "Podržet poslední hodnotu", "cpu_usage": "Využití CPU", "ram_usage": "Využití RAM"}
 }
 # ===========================================================================
 
@@ -95,30 +75,27 @@ HTML_CONTENT = """
         * { box-sizing: border-box; }
         html, body { height: 100%; margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: var(--bg-color); color: var(--text-color); transition: background-color 0.3s, color 0.3s; }
         .main-container { display: flex; flex-direction: column; height: 100%; width: 100%; padding: 1rem; }
-        header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 1rem; flex-shrink: 0; }
-        .title-area h1 { color: var(--primary-color); margin: 0; }
+        header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 1rem; flex-shrink: 0; border-bottom: 1px solid var(--border-color); }
+        .title-area h1 { color: var(--primary-color); margin: 0; font-size: 1.5rem; }
         #status { font-weight: bold; padding: 0.5rem; border-radius: 6px; transition: all 0.3s ease-in-out; }
         .status-connected { color: #198754; background-color: #d1e7dd; }
         .status-disconnected { color: #dc3545; background-color: #f8d7da; }
         .top-controls { display: flex; gap: 1rem; align-items: center; }
         .top-controls button { font-size: 0.8rem; padding: 0.5rem; cursor: pointer; background-color: var(--secondary-bg-color); border: 1px solid var(--border-color); color: var(--text-color); border-radius: 6px; }
-        .content-area { display: flex; flex: 1; gap: 1rem; overflow: hidden; }
+        .content-area { display: flex; flex: 1; gap: 1rem; overflow: hidden; padding-top: 1rem; }
         .left-panel, .right-panel { background: var(--card-bg-color); padding: 1.5rem; border-radius: 8px; box-shadow: 0 4px 12px var(--shadow-color); display: flex; flex-direction: column; }
         .left-panel { flex: 2; } .right-panel { flex: 1; }
-        .controls { margin-top: 1rem; display: grid; grid-template-columns: 1fr; gap: 1.5rem; text-align: left; }
+        .controls { display: grid; grid-template-columns: 1fr; gap: 1.5rem; text-align: left; }
         .control-group { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-        .control-group-row { display: flex; align-items: center; gap: 10px; }
+        .control-group-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
         .controls select, .controls input { font-size: 1rem; padding: 0.5rem; border-radius: 6px; border: 1px solid var(--border-color); background-color: var(--card-bg-color); color: var(--text-color); width: 100%; }
         input[type="checkbox"] { width: auto; }
         .data-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1.5rem; }
         .metric { background: var(--secondary-bg-color); padding: 1rem; border-radius: 6px; text-align: center; }
         .metric-label { font-size: 0.9rem; color: var(--secondary-text-color); }
         .metric-value { font-size: 1.8rem; font-weight: bold; color: var(--text-color); }
-        .mini-bargraph-container { width: 100%; height: 8px; background-color: var(--border-color); border-radius: 4px; margin-top: 0.75rem; overflow: hidden; }
-        .mini-bargraph-bar { height: 100%; width: 0%; border-radius: 4px; transition: width 0.1s linear, background-color 0.3s; }
-        .bargraph-container { width: 100%; height: 40px; background-color: var(--secondary-bg-color); border-radius: 6px; margin-top: 1rem; overflow: hidden; border: 1px solid var(--border-color); }
-        .bargraph-bar { height: 100%; width: 0%; border-radius: 6px; transition: width 0.1s linear, background-color 0.3s; }
-        .bargraph-axis { display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--secondary-text-color); padding: 0 5px; margin-top: 5px; }
+        .mini-bargraph-container { width: 100%; height: 10px; background-color: var(--border-color); border-radius: 5px; margin-top: 0.75rem; overflow: hidden; }
+        .mini-bargraph-bar { height: 100%; width: 0%; border-radius: 5px; transition: width 0.1s linear, background-color 0.3s; }
         #log-container { display: flex; flex-direction: column; height: 100%; }
         #log-header { margin-top: 0; }
         #log { flex: 1; background: var(--secondary-bg-color); color: var(--text-color); padding: 1rem; border-radius: 6px; overflow-y: scroll; font-family: "SF Mono", "Menlo", monospace; font-size: 0.8rem; text-align: left; }
@@ -127,6 +104,10 @@ HTML_CONTENT = """
         .approaching { background-color: var(--color-approaching); }
         .receding { background-color: var(--color-receding); }
         .static { background-color: var(--color-static); }
+        #theme-toggle { background: transparent; border: none; width: 40px; height: 40px; cursor: pointer; }
+        #theme-toggle svg { width: 24px; height: 24px; fill: var(--icon-fill); }
+        .dark-mode .sun-icon { display: block; } .dark-mode .moon-icon { display: none; }
+        .sun-icon { display: none; } .moon-icon { display: block; }
     </style>
 </head>
 <body>
@@ -138,30 +119,16 @@ HTML_CONTENT = """
             </div>
             <div class="top-controls">
                 <button id="lang-toggle" data-lang="lang_toggle">Česky</button>
-                <button id="theme-toggle" data-lang="toggle_theme" title="Toggle Theme">Toggle</button>
+                <button id="theme-toggle" data-lang="toggle_theme" title="Toggle Theme">
+                    <svg class="sun-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zm-9-7c.55 0 1-.45 1-1V3c0-.55-.45-1-1-1s-1 .45-1 1v2c0 .55.45 1 1 1zm0 12v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.64 7.05l-1.41-1.41c-.39-.39-1.02-.39-1.41 0s-.39 1.02 0 1.41l1.41 1.41c.39.39 1.02.39 1.41 0s.39-1.02 0-1.41zm12.72 12.72l-1.41-1.41c-.39-.39-1.02-.39-1.41 0s-.39 1.02 0 1.41l1.41 1.41c.39.39 1.02.39 1.41 0s.39-1.02 0-1.41zM19.78 5.64l-1.41 1.41c-.39-.39-.39 1.02 0 1.41s1.02.39 1.41 0l1.41-1.41c.39-.39.39-1.02 0-1.41s-1.02-.39-1.41 0zM7.05 19.78l-1.41 1.41c-.39-.39-.39 1.02 0 1.41s1.02.39 1.41 0l1.41-1.41c.39-.39.39-1.02 0-1.41s-1.02-.39-1.41 0z"/></svg>
+                    <svg class="moon-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.37 5.51A7.35 7.35 0 0 0 9.1 7.5c0 4.08 3.32 7.4 7.4 7.4.68 0 1.35-.09 2-.26-1.43 1.1-3.24 1.76-5.14 1.76A8.01 8.01 0 0 1 4.38 8.28c.17-.35.36-.69.57-1.02.43-.68.95-1.29 1.54-1.82.59-.53 1.25-1 1.95-1.39.02 0 .04-.01.06-.01.02 0 .03 0 .05.01.27.06.53.13.78.22.02.01.03.02.05.03.25.1.49.2.73.32.23.11.45.23.67.35.21.12.42.24.62.37.2.13.39.26.58.39.2.14.38.28.56.43.18.15.35.3.52.46.16.16.32.32.47.49.15.17.29.35.43.53zm-3.82 9.67c.88.54 1.86.95 2.91 1.18.42.09.85.16 1.28.21.3.03.6.06.9.06 1.75 0 3.39-.59 4.67-1.58-.57.25-1.17.45-1.79.6-1.52.37-3.09.56-4.69.56-2.9 0-5.63-.94-7.79-2.58.23.01.46.02.69.02.83 0 1.64-.15 2.4-.44z"/></svg>
+                </button>
             </div>
         </header>
         <div class="content-area">
             <div class="left-panel">
                 <div class="controls">
-                    <div class="control-group">
-                        <label for="range-selector" data-lang="range_label">Range:</label>
-                        <select id="range-selector"></select>
                     </div>
-                    <div class="control-group">
-                        <label for="frate-selector" data-lang="frate_label">Frequency:</label>
-                        <select id="frate-selector"></select>
-                    </div>
-                    <div class="control-group">
-                        <label for="sensitivity-slider" data-lang="sensitivity_label">Sensitivity:</label>
-                        <input type="range" id="sensitivity-slider" min="0.01" max="5.0" step="0.01" value="0.2">
-                        <span id="sensitivity-value">0.2</span>
-                    </div>
-                     <div class="control-group-row">
-                        <input type="checkbox" id="hold-toggle" checked>
-                        <label for="hold-toggle" data-lang="hold_label">Hold Last Value</label>
-                    </div>
-                </div>
                 <div class="data-grid">
                     <div class="metric"><div class="metric-label" data-lang="distance">Distance</div><span id="distance" class="metric-value">---</span> cm<div class="mini-bargraph-container"><div id="distance-mini-bar" class="mini-bargraph-bar"></div></div></div>
                     <div class="metric"><div class="metric-label" data-lang="speed">Speed</div><span id="speed" class="metric-value">---</span> m/s<div class="mini-bargraph-container"><div id="speed-mini-bar" class="mini-bargraph-bar"></div></div></div>
@@ -170,12 +137,14 @@ HTML_CONTENT = """
                     <div class="metric"><div class="metric-label" data-lang="sensor_uptime">Sensor Uptime</div><span id="sensor_uptime" class="metric-value">---</span></div>
                     <div class="metric"><div class="metric-label" data-lang="program_uptime">Program Uptime</div><span id="program_uptime" class="metric-value">---</span></div>
                 </div>
-                <div class="bargraph-container"><div id="distance-bar" class="bargraph-bar"></div></div>
-                <div class="bargraph-axis"><span>0cm</span><span id="axis-mid"></span><span id="axis-max"></span></div>
             </div>
             <div class="right-panel" id="log-container">
                 <h2 id="log-header" data-lang="log_header">Diagnostic Log</h2>
                 <div id="log"></div>
+                 <div class="data-grid" style="grid-template-columns: 1fr; margin-top: auto;">
+                    <div class="metric"><div class="metric-label" data-lang="cpu_usage">CPU Usage</div><span id="cpu" class="metric-value">---</span> %<div class="mini-bargraph-container"><div id="cpu-mini-bar" class="mini-bargraph-bar"></div></div></div>
+                    <div class="metric"><div class="metric-label" data-lang="ram_usage">RAM Usage</div><span id="ram" class="metric-value">---</span> %<div class="mini-bargraph-container"><div id="ram-mini-bar" class="mini-bargraph-bar"></div></div></div>
+                </div>
             </div>
         </div>
     </div>
@@ -187,21 +156,16 @@ HTML_CONTENT = """
                 speed: document.getElementById('speed'), direction: document.getElementById('direction'),
                 peak: document.getElementById('peak'), sensor_uptime: document.getElementById('sensor_uptime'),
                 program_uptime: document.getElementById('program_uptime'),
-                bar: document.getElementById('distance-bar'),
+                cpu: document.getElementById('cpu'), ram: document.getElementById('ram'),
                 bar_dist: document.getElementById('distance-mini-bar'),
                 bar_speed: document.getElementById('speed-mini-bar'),
                 bar_peak: document.getElementById('peak-mini-bar'),
-                log: document.getElementById('log'), rangeSelector: document.getElementById('range-selector'),
-                frateSelector: document.getElementById('frate-selector'),
-                sensitivitySlider: document.getElementById('sensitivity-slider'),
-                sensitivityValue: document.getElementById('sensitivity-value'),
+                bar_cpu: document.getElementById('cpu-mini-bar'),
+                bar_ram: document.getElementById('ram-mini-bar'),
+                log: document.getElementById('log'), 
                 themeToggle: document.getElementById('theme-toggle'), langToggle: document.getElementById('lang-toggle'),
-                axisMid: document.getElementById('axis-mid'), axisMax: document.getElementById('axis-max'),
-                holdToggle: document.getElementById('hold-toggle')
             };
-            let maxDistanceCm = 800, maxSpeedMs = 3, maxPeak = 10, langDict = {}, lastValidData = null;
-            const rangePresets = __RANGE_PRESETS__, defaultRange = "__DEFAULT_RANGE_KEY__";
-            const frameRates = __FRAME_RATES__, defaultFrameRate = __DEFAULT_FRAME_RATE__;
+            let langDict = {}, lastValidData = null;
             
             async function setLanguage(lang) {
                 try {
@@ -227,31 +191,6 @@ HTML_CONTENT = """
                 applyTheme(newTheme);
             });
             
-            rangePresets.forEach(key => {
-                const option = document.createElement('option');
-                option.value = key; option.textContent = key;
-                if (key === defaultRange) option.selected = true;
-                ui.rangeSelector.appendChild(option);
-            });
-            frameRates.forEach(rate => {
-                const option = document.createElement('option');
-                option.value = rate; option.textContent = rate + ' Hz';
-                if (rate === defaultFrameRate) option.selected = true;
-                ui.frateSelector.appendChild(option);
-            });
-
-            function sendConfig(ws) {
-                if (ws.readyState !== WebSocket.OPEN) return;
-                const rangeKey = ui.rangeSelector.value;
-                const frate = parseInt(ui.frateSelector.value, 10);
-                const sensitivity = parseFloat(ui.sensitivitySlider.value);
-                const rangeValueStr = rangeKey.split('m')[0].replace(',', '.');
-                maxDistanceCm = parseFloat(rangeValueStr) * 100;
-                ui.axisMid.textContent = (maxDistanceCm / 2).toFixed(0) + 'cm';
-                ui.axisMax.textContent = maxDistanceCm.toFixed(0) + 'cm';
-                ws.send(JSON.stringify({ action: 'reconfigure', range_key: rangeKey, frate: frate, sensitivity: sensitivity }));
-            }
-
             function updateUI(data) {
                 ui.program_uptime.textContent = data.program_uptime || '---';
                 const statusKey = (data.status || 'connecting').replace(/ /g, '_');
@@ -259,49 +198,41 @@ HTML_CONTENT = """
                 ui.status.className = data.status === 'connected' ? 'status-connected' : 'status-disconnected';
                 
                 const isDataValid = data.status === 'connected' && data.peak > 0;
+                const displayData = isDataValid ? data : lastValidData;
 
-                const displayData = (isDataValid) ? data : (ui.holdToggle.checked && lastValidData) ? lastValidData : data;
+                if(isDataValid) { lastValidData = data; }
 
-                if(isDataValid) {
-                    lastValidData = data;
-                } else if(ui.holdToggle.checked && lastValidData) {
-                    // update time fields on held data
-                    lastValidData.program_uptime = data.program_uptime;
-                    lastValidData.sensor_uptime = "0:00:00";
+                if (displayData) {
+                    ui.distance.textContent = displayData.distance_cm.toFixed(1);
+                    ui.speed.textContent = displayData.speed_ms.toFixed(2);
+                    ui.direction.textContent = langDict[displayData.direction.toLowerCase()] || displayData.direction;
+                    ui.peak.textContent = displayData.peak.toFixed(4);
+                    ui.sensor_uptime.textContent = isDataValid ? data.sensor_uptime : "0:00:00";
+                    ui.cpu.textContent = data.cpu_percent.toFixed(1);
+                    ui.ram.textContent = data.ram_percent.toFixed(1);
+
+                    const maxDistanceCm = parseFloat(data.max_range_cm) || 160;
+                    const dist_p = Math.min(100, Math.max(0, (displayData.distance_cm / maxDistanceCm) * 100));
+                    ui.bar_dist.style.width = `${dist_p}%`;
+                    ui.bar_speed.style.width = `${Math.min(100, Math.max(0, Math.abs(displayData.speed_ms) / 3.0 * 100))}%`;
+                    ui.bar_peak.style.width = `${Math.min(100, Math.max(0, displayData.peak / 10.0 * 100))}%`;
+                    ui.bar_cpu.style.width = `${data.cpu_percent}%`;
+                    ui.bar_ram.style.width = `${data.ram_percent}%`;
+
+                    const barsToColor = [ui.bar_dist, ui.bar_speed, ui.bar_peak];
+                    barsToColor.forEach(el => el.classList.remove('approaching', 'receding', 'static'));
+                    let cssClass = 'static';
+                    if(displayData.direction === 'Přibližování' || displayData.direction === 'Approaching') cssClass = 'approaching';
+                    else if (displayData.direction === 'Vzdalování' || displayData.direction === 'Receding') cssClass = 'receding';
+                    barsToColor.forEach(el => el.classList.add(cssClass));
                 }
-
-                ui.distance.textContent = displayData.distance_cm.toFixed(1);
-                ui.speed.textContent = displayData.speed_ms.toFixed(2);
-                ui.direction.textContent = langDict[displayData.direction.toLowerCase()] || displayData.direction;
-                ui.peak.textContent = displayData.peak.toFixed(4);
-                ui.sensor_uptime.textContent = displayData.sensor_uptime || '---';
-
-                const dist_p = Math.min(100, Math.max(0, (displayData.distance_cm / maxDistanceCm) * 100));
-                const speed_p = Math.min(100, Math.max(0, (Math.abs(displayData.speed_ms) / maxSpeedMs) * 100));
-                const peak_p = Math.min(100, Math.max(0, (displayData.peak / maxPeak) * 100));
-                
-                ui.bar.style.width = `${dist_p}%`;
-                ui.bar_dist.style.width = `${dist_p}%`;
-                ui.bar_speed.style.width = `${speed_p}%`;
-                ui.bar_peak.style.width = `${peak_p}%`;
-
-                const barsToColor = [ui.bar, ui.bar_dist, ui.bar_speed, ui.bar_peak];
-                barsToColor.forEach(el => el.classList.remove('approaching', 'receding', 'static'));
-                let cssClass = 'static';
-                if(displayData.direction === 'Přibližování' || displayData.direction === 'Approaching') cssClass = 'approaching';
-                else if (displayData.direction === 'Vzdalování' || displayData.direction === 'Receding') cssClass = 'receding';
-                barsToColor.forEach(el => el.classList.add(cssClass));
             }
 
             function connect() {
                 const ws = new WebSocket(`ws://${window.location.host}/ws`);
-
-                ws.onopen = () => { setLanguage(localStorage.getItem('language') || 'en').then(() => sendConfig(ws)); };
-                ui.rangeSelector.onchange = () => sendConfig(ws);
-                ui.frateSelector.onchange = () => sendConfig(ws);
-                ui.sensitivitySlider.oninput = () => { ui.sensitivityValue.textContent = ui.sensitivitySlider.value; };
-                ui.sensitivitySlider.onchange = () => sendConfig(ws);
-
+                
+                ws.onopen = () => { setLanguage(localStorage.getItem('language') || 'en'); };
+                
                 function addLog(msg, type = 'info') {
                     const entry = document.createElement('div');
                     entry.className = `log-entry ${type}`;
@@ -374,11 +305,11 @@ class DopplerAlgo:
 # ===========================================================================
 # Vlákno pro měření radaru
 # ===========================================================================
-shared_state = { "frate": DEFAULT_FRAME_RATE, "range_key": DEFAULT_RANGE_KEY, "peak_threshold": DEFAULT_PEAK_THRESHOLD, "reconfigure": True }
+shared_state = { "peak_threshold": DEFAULT_PEAK_THRESHOLD, "reconfigure": False }
 state_lock = threading.Lock()
 
 def log_and_broadcast(level, message, loop):
-    log_message = f"[{datetime.now():%Y-%m-%d %H:%M:%S.%f}] [{level.upper()}] {message}"
+    log_message = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level.upper()}] {message}"
     print(log_message)
     if not loop.is_closed():
         asyncio.run_coroutine_threadsafe(manager.broadcast({"type": "log", "level": level, "message": log_message}), loop)
@@ -388,35 +319,21 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
         program_uptime = datetime.now() - START_TIME
         message['program_uptime'] = str(program_uptime).split('.')[0]
         if not loop.is_closed(): asyncio.run_coroutine_threadsafe(manager.broadcast(message), loop)
-    
+
     time.sleep(1)
     smoothed_distance, smoothed_speed, device, connection_start_time = None, None, None, None
         
     while True:
         try:
-            with state_lock:
-                reconfigure_needed = shared_state["reconfigure"]
-                if reconfigure_needed:
-                    if device:
-                        try: device.stop_acquisition()
-                        except Exception: pass
-                    device = None; shared_state["reconfigure"] = False
-
             if device is None:
                 log_and_broadcast("info", "Pokus o připojení k radaru...", loop)
                 device = DeviceFmcw()
                 connection_start_time = datetime.now()
                 log_and_broadcast("success", f"Radar připojen: {device.get_sensor_type()}.", loop)
-
-                with state_lock:
-                    frate = shared_state['frate']
-                    range_key = shared_state['range_key']
                 
-                log_and_broadcast("info", f"Konfigurace: {range_key} @ {frate} Hz", loop)
-                max_range, range_res = RANGE_PRESETS[range_key]
-                metrics = FmcwMetrics(range_resolution_m=range_res, max_range_m=max_range, max_speed_m_s=3, speed_resolution_m_s=0.2, center_frequency_Hz=60_750_000_000)
+                metrics = FmcwMetrics(range_resolution_m=0.05, max_range_m=1.6, max_speed_m_s=3, speed_resolution_m_s=0.2, center_frequency_Hz=60_750_000_000)
                 sequence = device.create_simple_sequence(FmcwSimpleSequenceConfig())
-                sequence.loop.repetition_time_s = 1 / frate
+                sequence.loop.repetition_time_s = 1 / DEFAULT_FRAME_RATE
                 chirp_loop = sequence.loop.sub_sequence.contents
                 device.sequence_from_metrics(metrics, chirp_loop)
                 chirp = chirp_loop.loop.sub_sequence.contents.chirp
@@ -435,6 +352,10 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
             data_payload = {}
             sensor_uptime = datetime.now() - connection_start_time
             data_payload['sensor_uptime'] = str(sensor_uptime).split('.')[0]
+            # NEW: Add system stats
+            data_payload['cpu_percent'] = psutil.cpu_percent()
+            data_payload['ram_percent'] = psutil.virtual_memory().percent
+            data_payload['max_range_cm'] = metrics.max_range_m * 100
 
             if peak_value >= current_peak_threshold:
                 distance_cm = distance_m * 100
@@ -453,7 +374,7 @@ def run_radar_loop(loop: asyncio.AbstractEventLoop):
         
         except Exception as e:
             log_and_broadcast("error", f"Smyčka radaru selhala: {e}", loop)
-            broadcast_sync({"status": "waiting_for_device", "program_uptime": str(datetime.now() - START_TIME).split('.')[0]})
+            broadcast_sync({"status": "waiting_for_device", "program_uptime": str(datetime.now() - START_TIME).split('.')[0], "cpu_percent": 0, "ram_percent": 0})
             smoothed_distance, smoothed_speed, device, connection_start_time = None, None, None, None
             time.sleep(3)
 
@@ -472,16 +393,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 async def get():
-    content = HTML_CONTENT.replace(
-        "__RANGE_PRESETS__", json.dumps(list(RANGE_PRESETS.keys()))
-    ).replace(
-        '__DEFAULT_RANGE_KEY__', DEFAULT_RANGE_KEY
-    ).replace(
-        "__FRAME_RATES__", json.dumps(FRAME_RATES_HZ)
-    ).replace(
-        '__DEFAULT_FRAME_RATE__', str(DEFAULT_FRAME_RATE)
-    )
-    return HTMLResponse(content=content)
+    return HTMLResponse(content=HTML_CONTENT)
 
 @app.get("/lang/{lang_code}", response_class=JSONResponse)
 async def get_lang(lang_code: str):
@@ -494,25 +406,10 @@ async def favicon():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    loop = asyncio.get_running_loop()
     try:
         while True:
-            data = await websocket.receive_json()
-            with state_lock:
-                reconfigure_needed = False
-                if data.get('range_key') != shared_state.get('range_key'):
-                    shared_state['range_key'] = data['range_key']
-                    reconfigure_needed = True
-                if data.get('frate') != shared_state.get('frate'):
-                    shared_state['frate'] = data['frate']
-                    reconfigure_needed = True
-                if 'sensitivity' in data:
-                    shared_state['peak_threshold'] = data['sensitivity']
-                
-                if reconfigure_needed:
-                    shared_state['reconfigure'] = True
-                    log_and_broadcast("info", f"Přijata nová konfigurace: {shared_state}", loop)
-
+            # This version does not reconfigure, just keeps connection alive
+            await asyncio.sleep(1)
     except (WebSocketDisconnect, asyncio.CancelledError):
         manager.disconnect(websocket)
 
